@@ -198,6 +198,11 @@ impl CompletionRequest {
         if prompt_logprobs.is_some() && self.stream == Some(true) {
             return Err("`prompt_logprobs` is not available when streaming".to_string());
         }
+        let infill = self.suffix.as_deref().is_some_and(|s| !s.is_empty());
+        if infill && logprobs.is_some() && self.echo == Some(true) {
+            // The scored prompt is the infill template, not the echoed text.
+            return Err("`echo` with `logprobs` is not available with `suffix`".to_string());
+        }
         Ok((logprobs, prompt_logprobs))
     }
 }
@@ -359,27 +364,6 @@ pub(crate) async fn complete_all(
     Ok(completions)
 }
 
-/// Each job's prompt log-probabilities with `top` alternatives (see
-/// [`Engine::prompt_logprobs`]), scored before generating so a failure is
-/// the request's error.
-async fn score_prompts(
-    engine: &Arc<Engine>,
-    jobs: &[Job],
-    top: u32,
-) -> Result<Vec<Vec<TokenLogprob>>, ApiError> {
-    let engine = Arc::clone(engine);
-    let prompts: Vec<RawPrompt> = jobs.iter().map(|j| j.prompt.clone()).collect();
-    tokio::task::spawn_blocking(move || {
-        prompts
-            .iter()
-            .map(|p| engine.prompt_logprobs(&engine.tokenize_prompt(p)?, top))
-            .collect::<crate::Result<Vec<_>>>()
-    })
-    .await
-    .map_err(|e| ApiError::internal(e.to_string()))?
-    .map_err(ApiError::from)
-}
-
 /// `entries` with at most `top` alternatives each.
 fn alternatives(entries: &[TokenLogprob], top: u32) -> Vec<TokenLogprob> {
     entries
@@ -392,10 +376,33 @@ fn alternatives(entries: &[TokenLogprob], top: u32) -> Vec<TokenLogprob> {
         .collect()
 }
 
+/// A prompt's scored `entries`, with `top` alternatives, placed in the
+/// `echo`ed text.  They are placed with special tokens written out, as
+/// the echo writes them, and aligned to the echo's end: a prompt
+/// truncated at its front starts past the echo's start, and a BOS the
+/// tokenizer added (not in the echo) lands at its start.
+fn echo_entries(
+    engine: &Engine,
+    entries: &[TokenLogprob],
+    top: u32,
+    echo: &str,
+) -> Vec<TokenLogprob> {
+    let mut entries = alternatives(entries, top);
+    let placed = engine.place_prompt(&mut entries, false);
+    let echoed = echo.chars().count();
+    for entry in &mut entries {
+        entry.offset = (entry.offset + echoed).saturating_sub(placed);
+    }
+    entries
+}
+
 /// What a streamed request reports, prompt by prompt.  Each carries the
 /// log-probabilities of the tokens decoded since the last report, when the
 /// request asked for them.
 pub(crate) enum Progress<'a> {
+    /// The scored prompt of the prompt at this index, ahead of its text,
+    /// when the request asked for the prompt's log-probabilities.
+    Prompt(usize, &'a [TokenLogprob]),
     /// New text for the prompt at this index.
     Text(usize, &'a str, &'a [TokenLogprob]),
     /// The prompt at this index is done.
@@ -433,16 +440,29 @@ pub(crate) fn stream_all(
         };
         for (index, job) in jobs.iter().enumerate() {
             // Each prompt's tokens are placed in its own text.
-            let sink = options.logprobs.map(|_| LogprobSink::default());
+            let wanted = options.logprobs.is_some() || options.prompt_logprobs.is_some();
+            let sink = wanted.then(LogprobSink::default);
             options.logprob_sink = sink.clone();
             let take = || sink.as_ref().map(LogprobSink::take).unwrap_or_default();
+            // The scored prompt, once, ahead of the first text.
+            let prompt = |frame: &mut dyn FnMut(Progress<'_>) -> Option<Value>| {
+                let entries = sink
+                    .as_ref()
+                    .map(LogprobSink::take_prompt)
+                    .unwrap_or_default();
+                if !entries.is_empty() {
+                    send(frame(Progress::Prompt(index, &entries)));
+                }
+            };
             let result =
                 engine.complete_prompt_streaming(&job.prompt, &options, flag, &mut |text| {
+                    prompt(&mut frame);
                     send(frame(Progress::Text(index, text, &take())))
                 });
             match result {
                 Ok(completion) => {
                     metrics.record_generation(&completion.usage);
+                    prompt(&mut frame);
                     send(frame(Progress::Done(index, &completion, &take())));
                 }
                 Err(e) => {
@@ -513,6 +533,11 @@ pub(crate) async fn completions(
     )?;
     options.logprobs = logprobs;
     let echo = req.echo == Some(true);
+    // The prompts' own log-probabilities, scored as each is completed:
+    // `echo` repeats them with `logprobs` alternatives, vLLM's
+    // `prompt_logprobs` with its own count.
+    let echo_logprobs = logprobs.filter(|_| echo);
+    options.prompt_logprobs = echo_logprobs.max(prompt_logprobs);
     let build = Build {
         suffix: req.suffix.clone(),
         special: req.add_special_tokens.unwrap_or(true),
@@ -521,17 +546,6 @@ pub(crate) async fn completions(
     let jobs = build_jobs(&engine, build, &options, prompts).await?;
     let id = format!("cmpl-{}", Uuid::new_v4().simple());
     let created = unix_time();
-    // The prompts' own log-probabilities: `echo` repeats them with
-    // `logprobs` alternatives, vLLM's `prompt_logprobs` with its own count.
-    let echo_logprobs = logprobs.filter(|_| echo);
-    let scored = match echo_logprobs.max(prompt_logprobs) {
-        Some(top) => score_prompts(&engine, &jobs, top).await?,
-        None => Vec::new(),
-    };
-    let echoed: Vec<Vec<TokenLogprob>> = match echo_logprobs {
-        Some(top) => scored.iter().map(|p| alternatives(p, top)).collect(),
-        None => vec![Vec::new(); jobs.len()],
-    };
     // Where each choice's generated text starts.
     let shifts: Vec<usize> = jobs
         .iter()
@@ -543,17 +557,16 @@ pub(crate) async fn completions(
         // echoed prompt's go with it.
         let render = {
             let engine = Arc::clone(&engine);
-            move |index: usize, prompt: bool, entries: &[TokenLogprob]| -> Value {
+            move |index: usize, prompt: &[TokenLogprob], entries: &[TokenLogprob]| -> Value {
                 if logprobs.is_none() {
                     return Value::Null;
                 }
-                let prompt = if prompt { echoed[index].as_slice() } else { &[] };
                 crate::logprobs::completion(&engine, prompt, entries, shifts[index])
             }
         };
         let chunk = move |index: usize,
                           text: &str,
-                          prompt: bool,
+                          prompt: &[TokenLogprob],
                           entries: &[TokenLogprob],
                           finish: Option<&str>| {
             json!({
@@ -569,30 +582,41 @@ pub(crate) async fn completions(
         let count = jobs.len();
         let mut usages = Vec::with_capacity(count);
         let mut started = vec![false; count];
-        // The echoed prompt goes ahead of a prompt's first text (or its
-        // end, when it generated none).
-        let mut echo_once = move |index: usize| -> Option<String> {
+        // Each echoed prompt's scored tokens, until its echo is sent.
+        let mut scored: Vec<Vec<TokenLogprob>> = vec![Vec::new(); count];
+        let placer = Arc::clone(&engine);
+        let echo_texts = echoes.clone();
+        // The echoed prompt, and its tokens, go ahead of a prompt's first
+        // text (or its end, when it generated none).
+        let mut echo_once = move |index: usize,
+                                  scored: &mut Vec<Vec<TokenLogprob>>|
+              -> Option<(String, Vec<TokenLogprob>)> {
             (echo && !std::mem::replace(&mut started[index], true))
-                .then(|| echoes[index].clone())
-                .filter(|e| !e.is_empty())
+                .then(|| (echoes[index].clone(), std::mem::take(&mut scored[index])))
+                .filter(|(e, _)| !e.is_empty())
         };
         let frame = move |progress: Progress<'_>| -> Option<Value> {
             match progress {
+                Progress::Prompt(index, entries) => {
+                    if let Some(top) = echo_logprobs {
+                        scored[index] = echo_entries(&placer, entries, top, &echo_texts[index]);
+                    }
+                    None
+                }
                 Progress::Text(index, text, entries) => {
-                    let (text, prompt) = match echo_once(index) {
-                        Some(prompt) => (prompt + text, true),
-                        None => (text.to_string(), false),
+                    let (text, prompt) = match echo_once(index, &mut scored) {
+                        Some((echoed, prompt)) => (echoed + text, prompt),
+                        None => (text.to_string(), Vec::new()),
                     };
-                    Some(chunk(index, &text, prompt, entries, None))
+                    Some(chunk(index, &text, &prompt, entries, None))
                 }
                 Progress::Done(index, completion, entries) => {
                     usages.push(completion.usage.clone());
-                    let echoed = echo_once(index);
-                    let text = echoed.clone().unwrap_or_default();
+                    let (text, prompt) = echo_once(index, &mut scored).unwrap_or_default();
                     let mut last = chunk(
                         index,
                         &text,
-                        echoed.is_some(),
+                        &prompt,
                         entries,
                         Some(completion.finish_reason()),
                     );
@@ -630,10 +654,14 @@ pub(crate) async fn completions(
             } else {
                 completion.text.clone()
             };
+            let echoed = match echo_logprobs {
+                Some(top) => echo_entries(&engine, &completion.prompt_logprobs, top, &job.echo),
+                None => Vec::new(),
+            };
             let logprobs = match logprobs {
                 Some(_) => crate::logprobs::completion(
                     &engine,
-                    &echoed[index],
+                    &echoed,
                     &completion.logprobs,
                     shifts[index],
                 ),
@@ -644,8 +672,10 @@ pub(crate) async fn completions(
                 "finish_reason": completion.finish_reason(),
             });
             if let Some(top) = prompt_logprobs {
-                choice["prompt_logprobs"] =
-                    crate::logprobs::prompt(&engine, &alternatives(&scored[index], top));
+                choice["prompt_logprobs"] = crate::logprobs::prompt(
+                    &engine,
+                    &alternatives(&completion.prompt_logprobs, top),
+                );
             }
             choice
         })

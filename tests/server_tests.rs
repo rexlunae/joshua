@@ -2186,6 +2186,46 @@ async fn prompt_logprobs_score_the_prompt_as_decoding_scores_its_tokens() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 
+    // A truncated prompt is scored as it was completed: its kept tail,
+    // placed at the echoed text's end.
+    let (status, body) = call(
+        "/v1/completions",
+        serde_json::json!({
+            "model": "", "prompt": whole, "max_tokens": 1, "temperature": 0.0,
+            "ignore_eos": true, "echo": true, "logprobs": 0, "prompt_logprobs": 0,
+            "truncate_prompt_tokens": 3,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v = json(&body);
+    let choice = &v["choices"][0];
+    assert_eq!(choice["prompt_logprobs"].as_array().unwrap().len(), 3, "{body}");
+    assert_eq!(v["usage"]["prompt_tokens"], 3, "{body}");
+    let offsets: Vec<u64> = choice["logprobs"]["text_offset"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o.as_u64().unwrap())
+        .collect();
+    assert_eq!(offsets.len(), 4, "{body}");
+    assert!(offsets.windows(2).all(|w| w[0] <= w[1]), "{body}");
+    let echoed = choice["text"].as_str().unwrap().chars().count() as u64
+        - choice["logprobs"]["tokens"][3].as_str().unwrap().chars().count() as u64;
+    assert_eq!(offsets[3], echoed, "{body}");
+    assert!(offsets[0] > 0, "the dropped head comes first: {body}");
+
+    // An infill's scored prompt is its template, not the echoed text.
+    let (status, body) = call(
+        "/v1/completions",
+        serde_json::json!({
+            "model": "", "prompt": "a", "suffix": "b", "echo": true, "logprobs": 1,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("suffix"), "{body}");
+
     // Chat: the rendered prompt, one entry per prompt token.
     let chat = serde_json::json!({
         "model": "", "messages": [{"role": "user", "content": "hi"}],

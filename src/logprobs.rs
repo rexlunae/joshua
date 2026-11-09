@@ -65,7 +65,7 @@ pub(crate) fn chat(engine: &Engine, entries: &[TokenLogprob], split_reasoning: b
 /// `token_logprobs`, `top_logprobs` (each a token-to-logprob map holding
 /// the alternatives and the token itself, as vLLM's does) and
 /// `text_offset` arrays.  With `echo`, the `prompt`'s entries come first
-/// (see [`Engine::prompt_logprobs`]; its first token has none, so it is
+/// (see [`Completion::prompt_logprobs`](crate::engine::Completion::prompt_logprobs); its first token has none, so it is
 /// null) and the generated tokens' offsets move `shift` characters on,
 /// past the echoed prompt.  Offsets count characters into the choice's
 /// text, from where each token's text starts there.

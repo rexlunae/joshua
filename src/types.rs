@@ -212,6 +212,8 @@ pub struct LogprobSink(std::sync::Arc<std::sync::Mutex<LogprobQueue>>);
 
 #[derive(Default)]
 struct LogprobQueue {
+    /// The prompt's entries, once scored, until taken.
+    prompt: Vec<TokenLogprob>,
     entries: std::collections::VecDeque<TokenLogprob>,
     /// Entries starting before this byte of the text may be taken.
     released: usize,
@@ -225,6 +227,16 @@ impl LogprobSink {
     /// Add one token's figures.
     pub fn push(&self, entry: TokenLogprob) {
         self.queue().entries.push_back(entry);
+    }
+
+    /// Hand over the prompt's entries, scored before decoding starts.
+    pub fn set_prompt(&self, entries: Vec<TokenLogprob>) {
+        self.queue().prompt = entries;
+    }
+
+    /// The prompt's entries, once: empty until scored, and after.
+    pub fn take_prompt(&self) -> Vec<TokenLogprob> {
+        std::mem::take(&mut self.queue().prompt)
     }
 
     /// Let entries whose text starts before byte `end` be taken (`usize::MAX`
@@ -430,6 +442,12 @@ pub struct GenerationOptions {
     /// reports them by default.
     #[serde(default)]
     pub logprobs: Option<u32>,
+    /// Score the prompt too, reporting each prompt token's
+    /// [`TokenLogprob`] with this many alternatives (vLLM's
+    /// `prompt_logprobs`, and `echo` with `logprobs`): see
+    /// [`crate::engine::Completion::prompt_logprobs`].
+    #[serde(default)]
+    pub prompt_logprobs: Option<u32>,
     /// Where a streaming caller collects each token's [`TokenLogprob`] as
     /// it is decoded, to send with the text that follows; never from
     /// request JSON.
@@ -607,6 +625,7 @@ impl Default for GenerationOptions {
             reasoning_budget_message: None,
             constraint: None,
             logprobs: None,
+            prompt_logprobs: None,
             logprob_sink: None,
         }
     }
