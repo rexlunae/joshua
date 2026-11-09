@@ -41,9 +41,9 @@ pub(crate) fn count(field: &str, n: i64) -> Result<u32, String> {
 
 /// OpenAI chat's `logprobs` object: `{"content": [...]}`, one entry per
 /// answer token with its `token`, `logprob`, `bytes` and `top_logprobs`.
-/// When the response splits the reasoning off (`split_reasoning`), its
-/// tokens are left out as they are of `content`, so hidden reasoning stays
-/// hidden.
+/// When the response splits the reasoning off (`split_reasoning`), only
+/// the tokens whose text reaches the answer are kept, so hidden reasoning
+/// stays hidden and its markup is left out as it is of `content`.
 pub(crate) fn chat(engine: &Engine, entries: &[TokenLogprob], split_reasoning: bool) -> Value {
     let item = |id: u32, logprob: f32| {
         let (token, bytes) = piece(engine, id);
@@ -51,7 +51,7 @@ pub(crate) fn chat(engine: &Engine, entries: &[TokenLogprob], split_reasoning: b
     };
     let content: Vec<Value> = entries
         .iter()
-        .filter(|entry| !(split_reasoning && entry.reasoning))
+        .filter(|entry| !split_reasoning || entry.answer)
         .map(|entry| {
             let mut value = item(entry.token, entry.logprob);
             value["top_logprobs"] = entry.top.iter().map(|&(id, lp)| item(id, lp)).collect();

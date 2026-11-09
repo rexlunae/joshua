@@ -2322,7 +2322,7 @@ impl<'e> ChatStreamEmitter<'e> {
     fn take_logprobs(&self) -> Option<serde_json::Value> {
         let (engine, sink, split) = self.logprobs.as_ref()?;
         let entries = sink.take();
-        let answer = entries.iter().any(|e| !(*split && e.reasoning));
+        let answer = entries.iter().any(|e| !*split || e.answer);
         answer.then(|| crate::logprobs::chat(engine, &entries, *split))
     }
 

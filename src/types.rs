@@ -193,9 +193,10 @@ pub struct TokenLogprob {
     /// The same place in characters (the legacy completions API's
     /// `text_offset`).
     pub offset: usize,
-    /// Whether the token is part of a reasoning block (including its tags),
-    /// which a chat response splits off the answer.
-    pub reasoning: bool,
+    /// Whether the token's text reaches a chat response's answer once the
+    /// reasoning (and its markup) is split off: false for reasoning, its
+    /// tags, and the whitespace or headers dropped around them.
+    pub answer: bool,
 }
 
 /// A shared buffer the decode loop pushes [`TokenLogprob`]s into, for a
