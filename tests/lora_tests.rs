@@ -1251,9 +1251,24 @@ async fn vllm_runtime_lora_routes_and_adapter_named_models() {
     let table = load(&path).lora_slots().expect("the qwen loader applies LoRA");
     let file = write_adapter(path.parent().unwrap(), "style.gguf", &table, 0.0, &specs(&table, 2, 7, |_| true));
     let engine = Arc::new(joshua::Engine::with_n_ctx(&path, 64).unwrap());
+    // The adapter's file sits in the model directory, which lists it; it is
+    // not a model, so it reserves no name and `style` stays the adapter's.
+    let dir = path.parent().unwrap().to_path_buf();
     let router = |allow: bool| {
         create_router(Arc::new(ServerState {
             allow_runtime_lora: allow,
+            manager: Some(joshua::server::ModelManager {
+                model_dir: dir.clone(),
+                engine_options: Arc::new(|_: &Path| joshua::EngineOptions::with_n_ctx(64)),
+                npu_backend: None,
+                max_concurrency: None,
+                max_output_tokens: None,
+                allow_private_pull: false,
+                #[cfg(feature = "distributed")]
+                workers: Vec::new(),
+                #[cfg(feature = "distributed")]
+                cluster_key: None,
+            }),
             ..ServerState::new(Arc::clone(&engine))
         }))
     };

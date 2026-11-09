@@ -110,9 +110,7 @@ pub async fn vllm_load(
     // two of one name cannot both pass the check.
     let _serial = RUNTIME_LOADS.lock().await;
     let (_, engine) = select_model(&state, req.model.as_deref().unwrap_or_default()).await?;
-    let a_model = state.models.list().iter().any(|m| m.id == name)
-        || state.unloaded().iter().any(|(id, _)| *id == name);
-    if a_model {
+    if crate::server::names_a_model(&state, &name).await? {
         return Err(ApiError::bad_request(format!(
             "'{name}' is a model's id; an adapter needs a name of its own"
         )));

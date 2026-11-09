@@ -1093,12 +1093,10 @@ pub(crate) async fn select_generation(
     requested: &str,
 ) -> Result<Selected, ApiError> {
     let name = requested.trim();
-    // A model's id (loaded, or a model-directory file a request may load)
+    // A model's id (loaded, or a model-directory model a request may load)
     // wins over an adapter's name.
-    let a_model = state.models.loaded(name).is_some()
-        || state.unloaded().iter().any(|(id, _)| id == name);
-    if !a_model {
-        if let Some((engine, id)) = state.models.adapter(name) {
+    if let Some((engine, id)) = state.models.adapter(name) {
+        if !names_a_model(state, name).await? {
             return Ok(Selected {
                 model: name.to_string(),
                 engine,
@@ -1112,6 +1110,20 @@ pub(crate) async fn select_generation(
         engine,
         adapter: None,
     })
+}
+
+/// Whether `name` is a model's id: a loaded model's, or that of a
+/// model-directory file that is a model on its own ([`select_model`] would
+/// load it).  A directory GGUF that is not a model (an adapter, a
+/// projector) reserves no name.  Reads that file's header, off the runtime.
+pub(crate) async fn names_a_model(state: &AppState, name: &str) -> Result<bool, ApiError> {
+    if state.models.loaded(name).is_some() {
+        return Ok(true);
+    }
+    match state.unloaded().into_iter().find(|(id, _)| id == name) {
+        Some((_, path)) => is_model_file(&path).await,
+        None => Ok(false),
+    }
 }
 
 /// Whether `path` is a GGUF model on its own (not an adapter, projector or
@@ -1924,18 +1936,19 @@ async fn worker_info(State(state): State<AppState>) -> Result<Json<WorkerInfo>, 
         models: models
                 .iter()
                 .flat_map(|m| {
-                    let slots = |id: String, embeddings| ModelSlots {
+                    let slots = |id: String, embeddings, alias_of| ModelSlots {
                         id,
+                        alias_of,
                         n_ctx: Some(m.engine.n_ctx()),
                         max_concurrency: m.engine.max_concurrency(),
                         in_flight: m.engine.in_flight(),
                         embeddings,
                     };
-                    std::iter::once(slots(m.id.clone(), m.engine.supports_embeddings())).chain(
+                    std::iter::once(slots(m.id.clone(), m.engine.supports_embeddings(), None)).chain(
                         m.engine
                             .lora_adapters()
                             .into_iter()
-                            .map(move |a| slots(a.name, false)),
+                            .map(move |a| slots(a.name, false, Some(m.id.clone()))),
                     )
                 })
                 .collect(),
