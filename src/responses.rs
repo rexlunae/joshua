@@ -94,6 +94,12 @@ impl ResponseStore {
                 .iter()
                 .map(|item| item.to_string().len())
                 .sum::<usize>();
+        if bytes > STORE_BYTES {
+            // Past the whole budget on its own: kept, it would hold the
+            // store over its bound.  It cannot be fetched or continued.
+            tracing::warn!(id, bytes, "response too large for the store; not kept");
+            return;
+        }
         let mut inner = self.lock();
         if let Some(old) = inner.entries.remove(&id) {
             inner.bytes -= old.bytes;
@@ -352,9 +358,13 @@ fn response_format(format: &Value) -> Result<Option<Value>, String> {
         None | Some("text") => Ok(None),
         Some("json_object") => Ok(Some(json!({"type": "json_object"}))),
         Some("json_schema") => {
+            let body = format
+                .get("schema")
+                .filter(|s| s.is_object())
+                .ok_or("a `json_schema` text.format needs a `schema` object")?;
             let mut schema = json!({
                 "name": format.get("name").cloned().unwrap_or(json!("response")),
-                "schema": format.get("schema").cloned().unwrap_or(json!({})),
+                "schema": body,
             });
             if let Some(strict) = format.get("strict").filter(|s| !s.is_null()) {
                 schema["strict"] = strict.clone();
@@ -595,6 +605,15 @@ impl Meta {
         }
     }
 
+    /// How many function calls a turn may make.
+    fn max_calls(&self) -> usize {
+        if self.parallel_tool_calls {
+            usize::MAX
+        } else {
+            1
+        }
+    }
+
     /// The response object with `status` and `output`.
     fn response(&self, status: &str, output: Vec<Value>) -> Value {
         json!({
@@ -821,7 +840,8 @@ pub(crate) async fn create(
             vec![text_part(&answer.prose)],
         ));
     }
-    for call in &answer.calls {
+    // `parallel_tool_calls: false`: the first call only.
+    for call in answer.calls.iter().take(meta.max_calls()) {
         output.push(finished_call(call));
     }
     let response = meta.finished(&completion, output);
@@ -1168,22 +1188,7 @@ impl Emitter {
                 self.held.push_str(delta);
                 return;
             }
-            _ => {
-                let index = self.add(message_item(&new_id("msg"), "in_progress", Vec::new()));
-                let id = self.item_id(index);
-                self.send(
-                    "response.content_part.added",
-                    json!({
-                        "item_id": id, "output_index": index, "content_index": 0,
-                        "part": text_part(""),
-                    }),
-                );
-                self.open = Some(Open::Text {
-                    index,
-                    text: String::new(),
-                });
-                index
-            }
+            _ => self.open_text(),
         };
         let delta = std::mem::take(&mut self.held) + delta;
         if let Some(Open::Text { text, .. }) = &mut self.open {
@@ -1197,6 +1202,24 @@ impl Emitter {
                 "delta": delta, "logprobs": [],
             }),
         );
+    }
+
+    /// Add a message item and its (empty) text part.
+    fn open_text(&mut self) -> usize {
+        let index = self.add(message_item(&new_id("msg"), "in_progress", Vec::new()));
+        let id = self.item_id(index);
+        self.send(
+            "response.content_part.added",
+            json!({
+                "item_id": id, "output_index": index, "content_index": 0,
+                "part": text_part(""),
+            }),
+        );
+        self.open = Some(Open::Text {
+            index,
+            text: String::new(),
+        });
+        index
     }
 
     fn call_start(&mut self, call: usize, call_id: &str, name: &str) {
@@ -1236,6 +1259,9 @@ impl Emitter {
             ChatPiece::Reasoning(text) if show_reasoning => self.reasoning(text),
             ChatPiece::Reasoning(_) => {}
             ChatPiece::Text(text) => self.text(text),
+            // `parallel_tool_calls: false`: the first call only.
+            ChatPiece::CallStart { index, .. } | ChatPiece::CallArgs { index, .. }
+                if index >= self.meta.max_calls() => {}
             ChatPiece::CallStart { index, id, name } => self.call_start(index, id, name),
             ChatPiece::CallArgs { index, delta } => self.call_args(index, delta),
         }
@@ -1244,6 +1270,16 @@ impl Emitter {
     /// Close the open item and give the finished response, its function
     /// calls carrying the arguments as read from the answer.
     fn finish(&mut self, completion: &Completion, calls: &[ParsedToolCall]) -> Value {
+        // An answer of nothing (or only whitespace) and no call is an empty
+        // message, as the complete answer, trimmed, gives.
+        let answered = self
+            .output
+            .iter()
+            .any(|item| item["type"] == "message" || item["type"] == "function_call");
+        if !answered {
+            self.held.clear();
+            self.open_text();
+        }
         self.close();
         let mut calls = calls.iter();
         for item in &mut self.output {
@@ -1334,6 +1370,11 @@ mod tests {
         assert!(store.get("r0").is_none() && store.get("r1").is_none());
         assert!(store.get("r2").is_some());
         assert!(store.remove("r2") && !store.remove("r2"));
+        assert_eq!(store.len(), STORE_ENTRIES - 1);
+        // One response past the whole budget is not kept at all.
+        let huge = json!("x".repeat(STORE_BYTES + 1));
+        store.insert("huge".into(), huge, Vec::new());
+        assert!(store.get("huge").is_none());
         assert_eq!(store.len(), STORE_ENTRIES - 1);
     }
 }

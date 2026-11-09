@@ -2436,6 +2436,10 @@ async fn responses_answer_store_continue_and_stream() {
         (serde_json::json!({"truncation": "auto"}), "truncation"),
         (serde_json::json!({"conversation": "conv_1"}), "conversation"),
         (serde_json::json!({"input": [{"type": "item_reference", "id": "x"}]}), "item_reference"),
+        (
+            serde_json::json!({"text": {"format": {"type": "json_schema", "name": "a"}}}),
+            "schema",
+        ),
     ] {
         let mut body = request.clone();
         body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
