@@ -1146,3 +1146,113 @@ async fn lora_adapters_routes_list_and_set_scales() {
     let (status, err) = call("POST", "/lora-adapters", json!([{"id": 9, "scale": 1.0}])).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
 }
+
+/// vLLM's runtime LoRA routes and adapter-named models: an adapter loaded
+/// with `/v1/load_lora_adapter` is listed by `/v1/models` under its base and
+/// runs when a request names it as its `model`.
+#[tokio::test]
+async fn vllm_runtime_lora_routes_and_adapter_named_models() {
+    use axum::body::Body;
+    use axum::http::{header, Request, StatusCode};
+    use joshua::server::{create_router, ServerState};
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
+
+    let path = fixture("vllm", "qwen3", |p| common::write_tiny_qwen_gguf(p, "qwen3"));
+    let table = load(&path).lora_slots().expect("the qwen loader applies LoRA");
+    let file = write_adapter(path.parent().unwrap(), "style.gguf", &table, 0.0, &specs(&table, 2, 7, |_| true));
+    let engine = Arc::new(joshua::Engine::with_n_ctx(&path, 64).unwrap());
+    let router = |allow: bool| {
+        create_router(Arc::new(ServerState {
+            allow_runtime_lora: allow,
+            ..ServerState::new(Arc::clone(&engine))
+        }))
+    };
+    let call = |app: axum::Router, method: &str, uri: &str, body: Value| {
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(if method == "GET" { Body::empty() } else { Body::from(body.to_string()) })
+            .unwrap();
+        async move {
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+    };
+    let load_body = json!({"lora_name": "style", "lora_path": file.display().to_string()});
+
+    // Off unless the server allows it.
+    let (status, _) = call(router(false), "POST", "/v1/load_lora_adapter", load_body.clone()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let app = router(true);
+    let (status, text) = call(app.clone(), "POST", "/v1/load_lora_adapter", load_body.clone()).await;
+    assert_eq!((status, text.as_str()), (StatusCode::OK, "Success: LoRA adapter 'style' added successfully."));
+    let (status, _) = call(app.clone(), "POST", "/v1/load_lora_adapter", load_body.clone()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "already loaded");
+    let (status, _) = call(app.clone(), "POST", "/v1/load_lora_adapter", json!({"lora_name": "x"})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "no path");
+    let missing = json!({"lora_name": "x", "lora_path": path.with_file_name("missing.gguf").display().to_string()});
+    let (status, _) = call(app.clone(), "POST", "/v1/load_lora_adapter", missing).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "no such file");
+    // Replaced in place, it keeps its name.
+    let inplace = json!({"lora_name": "style", "lora_path": file.display().to_string(), "load_inplace": true});
+    let (status, text) = call(app.clone(), "POST", "/v1/load_lora_adapter", inplace).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+
+    // Listed as a model whose parent is the base.
+    let (_, models) = call(app.clone(), "GET", "/v1/models", Value::Null).await;
+    let models: Value = serde_json::from_str(&models).unwrap();
+    let cards = models["data"].as_array().unwrap();
+    let base_id = cards[0]["id"].as_str().unwrap().to_string();
+    let card = cards.iter().find(|c| c["id"] == "style").expect("the adapter is listed");
+    assert_eq!(card["parent"], base_id.as_str());
+    assert!(card["root"].as_str().unwrap().ends_with("style.gguf"), "{card}");
+    let (status, _) = call(app.clone(), "GET", "/v1/models/style", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Naming it runs it; naming the base does not.
+    let chat = |model: &str, lora: Option<Value>| {
+        let mut body = json!({"model": model, "messages": [{"role": "user", "content": "hi"}],
+                              "max_tokens": 3, "temperature": 0, "logprobs": true});
+        if let Some(lora) = lora {
+            body["lora"] = lora;
+        }
+        let app = app.clone();
+        async move {
+            let (status, text) = call(app, "POST", "/v1/chat/completions", body).await;
+            assert_eq!(status, StatusCode::OK, "{text}");
+            serde_json::from_str::<Value>(&text).unwrap()
+        }
+    };
+    let id = engine.lora_id("style").unwrap();
+    let named = chat("style", None).await;
+    assert_eq!(named["model"], "style");
+    let listed = chat(&base_id, Some(json!([{"id": id, "scale": 1.0}]))).await;
+    let base = chat(&base_id, None).await;
+    assert_eq!(named["choices"][0]["logprobs"], listed["choices"][0]["logprobs"]);
+    assert_ne!(named["choices"][0]["logprobs"], base["choices"][0]["logprobs"]);
+    // A request's own list still wins over the name.
+    let off = chat("style", Some(json!([]))).await;
+    assert_eq!(off["choices"][0]["logprobs"], base["choices"][0]["logprobs"]);
+    // The raw completions route takes the name too.
+    let (status, text) = call(
+        app.clone(),
+        "POST",
+        "/v1/completions",
+        json!({"model": "style", "prompt": "hi", "max_tokens": 2, "temperature": 0}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(serde_json::from_str::<Value>(&text).unwrap()["model"], "style");
+
+    let unload = json!({"lora_name": "style"});
+    let (status, text) = call(app.clone(), "POST", "/v1/unload_lora_adapter", unload.clone()).await;
+    assert_eq!((status, text.as_str()), (StatusCode::OK, "Success: LoRA adapter 'style' removed successfully."));
+    let (status, _) = call(app.clone(), "POST", "/v1/unload_lora_adapter", unload).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(engine.lora_adapters().is_empty());
+}

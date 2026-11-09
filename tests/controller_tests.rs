@@ -64,6 +64,7 @@ fn state(models: ModelRegistry, manager: Option<ModelManager>) -> Arc<ServerStat
         reasoning_format: Default::default(),
         metrics: Arc::new(joshua::server::ServerMetrics::default()),
         responses: Default::default(),
+        allow_runtime_lora: false,
     })
 }
 
@@ -684,6 +685,7 @@ async fn model_paths_stay_inside_the_model_directory_and_management_is_opt_in() 
         ("/v1/models/load", false),
         ("/v1/models/unload", false),
         ("/lora-adapters", false),
+        ("/v1/load_lora_adapter", false),
     ] {
         let res = app.clone().oneshot(preflight(uri)).await.unwrap();
         assert_eq!(

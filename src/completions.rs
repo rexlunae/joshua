@@ -34,7 +34,7 @@ use uuid::Uuid;
 use crate::engine::{Completion, Engine, PromptPart, RawPrompt};
 use crate::fim::InfillChunk;
 use crate::sampling::SamplingProfile;
-use crate::server::{select_model, sse_response, ApiError, AppState, CancelOnDrop, ServerMetrics};
+use crate::server::{select_generation, sse_response, Selected, ApiError, AppState, CancelOnDrop, ServerMetrics};
 use crate::types::{
     unix_time, ConstraintSpec, GenerationOptions, LogprobSink, SamplingParams, TokenLogprob,
     UsageInfo, MAX_TOKENS_UNLIMITED,
@@ -309,6 +309,7 @@ pub(crate) fn options(
     profile: SamplingProfile,
     constraint: Option<ConstraintSpec>,
     headers: &HeaderMap,
+    adapter: Option<&Selected>,
 ) -> Result<GenerationOptions, ApiError> {
     let sampling: SamplingParams =
         serde_json::from_value(body.clone()).map_err(|e| ApiError::bad_request(e.to_string()))?;
@@ -317,6 +318,9 @@ pub(crate) fn options(
         .apply(&mut options)
         .map_err(ApiError::bad_request)?;
     options.constraint = constraint;
+    if let Some(selected) = adapter {
+        selected.apply(&mut options);
+    }
     let key = body.get("prompt_cache_key").and_then(Value::as_str);
     options.cache_scope = Some(crate::affinity::cache_scope(headers, None, key));
     engine.validate_options(&options).map_err(ApiError::from)?;
@@ -523,14 +527,16 @@ pub(crate) async fn completions(
         }
         None => None,
     };
-    let (model, engine) = select_model(&state, &req.model).await?;
+    let selected = select_generation(&state, &req.model).await?;
     let mut options = options(
-        &engine,
+        &selected.engine,
         &body,
         SamplingProfile::OpenAi,
         constraint,
         &headers,
+        Some(&selected),
     )?;
+    let Selected { model, engine, .. } = selected;
     options.logprobs = logprobs;
     let echo = req.echo == Some(true);
     // The prompts' own log-probabilities, scored as each is completed:

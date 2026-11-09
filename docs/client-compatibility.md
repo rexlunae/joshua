@@ -82,7 +82,8 @@ bulk of it.  Of vLLM's own additions:
 | `POST /v1/score`, `/score` | ✅ with a generative reranker (Qwen3-Reranker and its fine-tunes): `text_1` against each `text_2`, or pair by pair; `instruction`. Cross-encoder and late-interaction score models are not supported |
 | `POST /v1/rerank`, `/rerank`, `/v2/rerank` | ✅ with a generative reranker: `query`, `documents` (strings or `{"text"}`), `top_n`, `return_documents`, `instruction`; results sorted by `relevance_score` |
 | `/classify`, `/pooling` | ❌ **by design** — they are for pooling models with a classification or pooling head, which joshua does not run |
-| `/v1/load_lora_adapter`, `/v1/unload_lora_adapter` | ❌ not yet: adapters load at startup (`--lora`) and run per request through llama-server's `lora` list, which the OpenAI routes accept too |
+| `/v1/load_lora_adapter`, `/v1/unload_lora_adapter` | ✅ with `--allow-runtime-lora` (vLLM's `VLLM_ALLOW_RUNTIME_LORA_UPDATING`): `{"lora_name", "lora_path", "load_inplace"}` and `{"lora_name"}`, answered with vLLM's `Success: ...` text; GGUF adapters only. Without the flag both are `404` |
+| adapter-named models | ✅ `/v1/models` lists each loaded adapter with `parent` set to its base; naming one as `model` on `/v1/chat/completions`, `/v1/completions` or `/v1/responses` runs it at scale 1 |
 | `/v1/responses` | ✅ see OpenAI above |
 | `/v1/chat/completions/batch` | ❌ not implemented |
 
@@ -223,3 +224,18 @@ The selection is part of the request's cache namespace: pooled sessions,
 prefix-cache entries and snapshots computed under one set of adapters and
 scales are only continued under the same set.  Requests with images (which
 run on the NPU plugin) refuse adapters.
+
+As in vLLM, each loaded adapter is also a model: `/v1/models` lists it under
+its name with its base as `parent`, and a request on `/v1/chat/completions`,
+`/v1/completions` or `/v1/responses` that names it as its `model` runs the
+base model with that adapter at scale 1 (its own `lora` list, if it sends
+one, still wins).  A model's own id is never taken as an adapter's name.
+With `--allow-runtime-lora`, vLLM's `POST /v1/load_lora_adapter`
+(`{"lora_name", "lora_path"}`, `load_inplace` to replace one) and
+`POST /v1/unload_lora_adapter` (`{"lora_name"}`) load and unload adapters
+while the server runs; a body's `model` picks the base when several are
+loaded.  Adapters loaded this way start at server-wide scale 0, so requests
+that do not name them are unchanged.  The paths are read as given, so the
+flag is off by default; these routes, like `/lora-adapters` and model
+management, take the API key and send no CORS headers.  An unloaded adapter's
+weights are freed once the requests running it finish.

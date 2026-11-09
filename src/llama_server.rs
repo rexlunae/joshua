@@ -324,6 +324,7 @@ async fn prepare(
         SamplingProfile::LlamaCpp,
         constraint,
         headers,
+        None,
     )?;
     options.logprobs = req.n_probs.filter(|n| *n > 0);
     let frame = Frame {
