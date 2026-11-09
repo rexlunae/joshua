@@ -880,13 +880,24 @@ async fn unload_named(state: &AppState, name: &str) -> Result<String, ApiError> 
 /// leaves its base loaded); `None` when no adapter has that name or a
 /// model's id is it.
 async fn unload_adapter(state: &AppState, name: &str) -> Result<Option<String>, ApiError> {
+    let held = crate::lora_api::RUNTIME_LOADS.lock().await;
+    unload_adapter_held(state, name, &held).await
+}
+
+/// [`unload_adapter`] for a caller already holding the runtime-load lock,
+/// so a check, a change on disk and this unload are one step to the
+/// runtime routes.
+async fn unload_adapter_held(
+    state: &AppState,
+    name: &str,
+    _held: &tokio::sync::MutexGuard<'_, ()>,
+) -> Result<Option<String>, ApiError> {
     let Some((engine, _)) = state.models.adapter(name) else {
         return Ok(None);
     };
     if crate::server::names_a_model(state, name).await? {
         return Ok(None);
     }
-    let _serial = crate::lora_api::RUNTIME_LOADS.lock().await;
     match engine.unload_lora(name) {
         Ok(_) => Ok(Some(name.to_string())),
         // Another request let it go first.
@@ -1606,7 +1617,10 @@ pub async fn delete(
     // An adapter model `create` made, when no model file has its name.
     if !path.exists() {
         if let Some(created) = state.adapter_model(strip_tag(name)) {
-            unload_adapter(&state, &created.name).await?;
+            // Held until the files are gone, so a request cannot load the
+            // adapter again in between.
+            let held = crate::lora_api::RUNTIME_LOADS.lock().await;
+            unload_adapter_held(&state, &created.name, &held).await?;
             let dir = model_dir_of(&state)?;
             crate::ollama_pull::delete_adapter(&dir, &created.name)
                 .map_err(|e| ApiError::internal(format!("removing {}: {e}", created.dir.display())))?;
@@ -1649,13 +1663,19 @@ pub async fn copy(
                 "`{dest}` is a model; delete it before copying an adapter model to its name"
             )));
         }
+        // One step to the runtime routes: no adapter of the destination's
+        // name can be loaded between the check and the unload.
+        let held = crate::lora_api::RUNTIME_LOADS.lock().await;
         refuse_runtime_adapter(&state, stem)?;
         let dir = model_dir_of(&state)?;
-        crate::ollama_pull::copy_adapter(&dir, strip_tag(source), stem)
+        let (from, to) = (strip_tag(source).to_string(), stem.to_string());
+        tokio::task::spawn_blocking(move || crate::ollama_pull::copy_adapter(&dir, &from, &to))
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
             .map_err(|e| ApiError::internal(format!("copying `{source}`: {e}")))?;
         // A destination adapter already loaded holds its old weights; the
         // next request loads the copied files.
-        unload_adapter(&state, stem).await?;
+        unload_adapter_held(&state, stem, &held).await?;
         return Ok(StatusCode::OK);
     }
     if !from.exists() {
@@ -1789,6 +1809,9 @@ async fn create_adapter_model(
             "`{name}` is a model; delete it first or give the adapter model another name"
         )));
     }
+    // The check, the write and the unload are one step to the runtime
+    // routes, which take the same lock.
+    let held = crate::lora_api::RUNTIME_LOADS.lock().await;
     refuse_runtime_adapter(state, &stem)?;
     let lines = tokio::task::spawn_blocking({
         let (state, stem, base, body) = (Arc::clone(state), stem.clone(), base.clone(), body.clone());
@@ -1796,7 +1819,7 @@ async fn create_adapter_model(
     })
     .await
     .map_err(|e| ApiError::internal(e.to_string()))??;
-    unload_adapter(state, &stem).await?;
+    unload_adapter_held(state, &stem, &held).await?;
     Ok(crate::ollama_pull::status_response(lines, stream))
 }
 
