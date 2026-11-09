@@ -1953,6 +1953,7 @@ async fn chat_completions(
     let reasoning_output = req
         .reasoning_output(state.reasoning_format)
         .map_err(ApiError::bad_request)?;
+    let prompt_logprobs = req.prompt_logprob_count().map_err(ApiError::bad_request)?;
     options.cache_scope = Some(crate::affinity::cache_scope(
         &headers,
         options.context_window,
@@ -2018,12 +2019,20 @@ async fn chat_completions(
         engine.tool_call_format()
     };
     let cancel = CancelOnDrop::new();
+    // vLLM's `prompt_logprobs`: the rendered prompt, scored as it is
+    // completed.
+    options.prompt_logprobs = prompt_logprobs;
     let completion = tokio::task::spawn_blocking({
         let engine = Arc::clone(&engine);
         let tools = tools.clone();
         let flag = cancel.flag();
         move || {
-            engine.complete_chat_cancellable_detailed(&messages, tools.as_deref(), &options, &flag)
+            engine.complete_chat_cancellable_detailed(
+                &messages,
+                tools.as_deref(),
+                &options,
+                &flag,
+            )
         }
     })
     .await
@@ -2089,6 +2098,8 @@ async fn chat_completions(
         completion.usage.clone(),
     );
     response.timings = Some(completion.timings);
+    response.prompt_logprobs = (!completion.prompt_logprobs.is_empty())
+        .then(|| crate::logprobs::prompt(&engine, &completion.prompt_logprobs));
     Ok(Json(response).into_response())
 }
 /// One piece of a chat completion's output, in the order to send it.

@@ -258,6 +258,8 @@ async fn answer(
         let facts: Vec<JobFacts> = jobs.iter().map(JobFacts::of).collect();
         let framer = move |progress: Progress<'_>| -> Option<Value> {
             Some(match progress {
+                // llama-server reports no prompt log-probabilities.
+                Progress::Prompt(..) => return None,
                 Progress::Text(index, text, entries) => frame.partial(index, text, entries),
                 Progress::Done(index, completion, entries) => {
                     frame.result(index, "", &facts[index], completion, entries)

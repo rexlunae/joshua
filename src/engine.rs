@@ -1720,6 +1720,14 @@ pub struct Completion {
     /// Each generated token's log-probability, when
     /// [`GenerationOptions::logprobs`] asked for them.
     pub logprobs: Vec<crate::types::TokenLogprob>,
+    /// Each prompt token's log-probability given the tokens before it,
+    /// when [`GenerationOptions::prompt_logprobs`] asked for them: the
+    /// prompt as generation saw it (templated, truncated).  Nothing
+    /// predicts the first token, so its entry carries only the token and
+    /// renderers write it as null.  Entries are placed in the prompt's text
+    /// with special tokens left out ([`Engine::place_prompt`] places them
+    /// otherwise).
+    pub prompt_logprobs: Vec<crate::types::TokenLogprob>,
 }
 
 impl Completion {
@@ -1748,6 +1756,7 @@ impl Completion {
             reasoning_open: false,
             reasoning_tokens: None,
             logprobs: Vec::new(),
+            prompt_logprobs: Vec::new(),
         }
     }
 
@@ -3631,43 +3640,16 @@ impl Engine {
                 }
             }
             first_window = false;
-            for slice in crate::ppl::slices(start, end, crate::ppl::SCORE_ROWS_PER_PASS) {
-                let fed = &tokens[slice.from..slice.to];
-                let targets = &tokens[slice.from..slice.target_end];
-                if all_positions {
-                    match session
-                        .as_mut()
-                        .expect("active session")
-                        .forward_tokens_all(fed, slice.pos, device)
-                    {
-                        Ok(rows) => { acc.push_window(targets, &rows); }
-                        Err(error) => { outcome = Err(error); break; }
-                    }
-                } else {
-                    let mut rows = Vec::with_capacity(fed.len());
-                    for (i, tok) in fed.iter().enumerate() {
-                        if slice.from + i + 1 >= slice.target_end {
-                            break;
-                        }
-                        match session
-                            .as_mut()
-                            .expect("active session")
-                            .forward_tokens(std::slice::from_ref(tok), slice.pos + i, device)
-                        {
-                            Ok(logits) => rows.push(logits),
-                            Err(error) => {
-                                outcome = Err(error);
-                                break;
-                            }
-                        }
-                    }
-                    if outcome.is_ok() {
-                        acc.push_window(targets, &rows);
-                    }
-                }
-                if outcome.is_err() {
-                    break;
-                }
+            if let Err(error) = score_window(
+                session.as_mut().expect("active session"),
+                &tokens[start..end],
+                all_positions,
+                device,
+                &mut |_, targets, rows| {
+                    acc.push_window(targets, rows);
+                },
+            ) {
+                outcome = Err(error);
             }
             if outcome.is_err() {
                 break;
@@ -3677,6 +3659,121 @@ impl Engine {
             self.release_model(session.expect("available session"), Vec::new(), None);
         }
         outcome.map(|_| acc)
+    }
+
+    /// Each of `tokens`' log-probability given the tokens before it, with
+    /// the `top` likeliest alternatives at each position (see
+    /// [`Completion::prompt_logprobs`]).  Runs inside a generation's
+    /// admission permit: the prompt is fed from position 0 on a fresh
+    /// candle session in the bounded slices [`Engine::perplexity`] uses,
+    /// and the session is parked holding all but the prompt's last token,
+    /// so generation picks it up with only that token left to feed.  The
+    /// prompt's shared head (`root`) still becomes a prefix-cache root,
+    /// though generation then starts past it.
+    fn score_prompt(
+        &self,
+        tokens: &[u32],
+        root: Option<usize>,
+        top: u32,
+        scope: Option<crate::affinity::Scope>,
+    ) -> Result<Vec<crate::types::TokenLogprob>> {
+        if self.arch_error.is_some() {
+            return Err(JoshuaError::InvalidRequest(
+                "`prompt_logprobs` needs the CPU/GPU backend, which this model has none of"
+                    .to_string(),
+            ));
+        }
+        let mut entries: Vec<crate::types::TokenLogprob> = tokens
+            .iter()
+            .map(|&token| crate::types::TokenLogprob {
+                token,
+                ..Default::default()
+            })
+            .collect();
+        let (mut session, _) = self.acquire_session(&[], false, scope)?;
+        let all_positions = session.supports_speculative();
+        let scored = score_window(
+            &mut session,
+            tokens,
+            all_positions,
+            &self.dense_device,
+            &mut |from, targets, rows| {
+                for (i, row) in rows.iter().enumerate() {
+                    if let Some(&target) = targets.get(i + 1) {
+                        let scored = token_logprob(row, target, top);
+                        let entry = &mut entries[from + i + 1];
+                        entry.logprob = scored.logprob;
+                        entry.top = scored.top;
+                        entry.rank = scored.rank;
+                    }
+                }
+            },
+        );
+        // A recurrent session cannot be cut back to the prompt's shared head,
+        // so when that head's prefix-cache root is wanted the session is
+        // cleared and generation reads the prompt again, storing the root.
+        let reread = root.is_some_and(|r| {
+            r < tokens.len()
+                && !session.supports_truncate()
+                && session.supports_snapshot()
+                && self.root_wanted(&tokens[..r], scope)
+                // A root the cache cannot hold is not worth a second read.
+                && self.root_may_fit(&session, r, tokens.len())
+        });
+        match scored {
+            // All but the last token, which generation feeds for its logits.
+            Ok(fed) if !reread && (fed < tokens.len() || session.truncate_to(fed - 1)) => {
+                let kept = fed.min(tokens.len() - 1);
+                // Generation starts past the shared head, so its root is
+                // stored here, from the session cut back to the head.
+                let root = root.filter(|&r| {
+                    r <= kept
+                        && session.supports_snapshot()
+                        && session.supports_truncate()
+                        && self.root_wanted(&tokens[..r], scope)
+                });
+                if let Some(r) = root {
+                    self.store_root(&session, &tokens[..r], kept, scope);
+                }
+                self.release_model(session, tokens[..kept].to_vec(), scope);
+            }
+            Ok(_) => {
+                if session.clear_state() {
+                    self.release_model(session, Vec::new(), scope);
+                }
+            }
+            Err(e) => {
+                if session.clear_state() {
+                    self.release_model(session, Vec::new(), scope);
+                }
+                return Err(e);
+            }
+        }
+        self.place_prompt(&mut entries, true);
+        Ok(entries)
+    }
+
+    /// Place prompt entries in the prompt's text (each entry's `start` and
+    /// `offset`), decoding with special tokens left out or, unless
+    /// `skip_special`, written out; returns the text's length in
+    /// characters.
+    pub fn place_prompt(
+        &self,
+        entries: &mut [crate::types::TokenLogprob],
+        skip_special: bool,
+    ) -> usize {
+        let mut text = self.tokenizer.decode_stream(skip_special);
+        let (mut bytes, mut chars) = (0, 0);
+        for entry in entries {
+            entry.start = bytes;
+            entry.offset = chars;
+            entry.answer = true;
+            if let Ok(Some(piece)) = text.step(entry.token) {
+                bytes += piece.len();
+                chars += piece.chars().count();
+            }
+        }
+        chars
     }
 
     /// Detokenize `tokens` back to text — the inverse of
@@ -4454,6 +4551,12 @@ impl Engine {
         cancel: Option<&AtomicBool>,
         on_text: Option<&mut (dyn FnMut(&str) + '_)>,
     ) -> Result<Completion> {
+        if options.prompt_logprobs.is_some() {
+            // The images' embeddings are not tokens to score.
+            return Err(JoshuaError::InvalidRequest(
+                "`prompt_logprobs` is not supported with images".to_string(),
+            ));
+        }
         // Bound concurrent heavyweight generations before doing any work.
         let _permit = InFlightGuard::acquire_with(
             &self.in_flight,
@@ -4610,6 +4713,7 @@ impl Engine {
             reasoning_open,
             reasoning_tokens: outcome.reasoning_tokens,
             logprobs: outcome.logprobs,
+            prompt_logprobs: Vec::new(),
         }
     }
 
@@ -4844,11 +4948,27 @@ impl Engine {
         // bad words past their limits.
         self.check_token_controls(options)?;
 
+        // ── Score the prompt, when asked ───────────────────────────────────
+        // On the candle path, which can score every position; generation
+        // then stays there too, so both come from one backend.
+        let prompt_logprobs = match options.prompt_logprobs {
+            Some(top) => {
+                let entries =
+                    self.score_prompt(prompt_tokens, root, top, options.cache_namespace())?;
+                if let Some(sink) = &options.logprob_sink {
+                    sink.set_prompt(entries.clone());
+                }
+                entries
+            }
+            None => Vec::new(),
+        };
+        let allow_npu = options.prompt_logprobs.is_none();
+
         // ── Acquire a session, generate, retry on CPU if the NPU fails ──────
         // Prefer a pooled instance whose state already covers a prefix of
         // this prompt; fall back to a reset instance or a fresh load.
         let (mut session, n_reused) =
-            self.acquire_session(prompt_tokens, true, options.cache_namespace())?;
+            self.acquire_session(prompt_tokens, allow_npu, options.cache_namespace())?;
         let was_npu = session.is_npu();
 
         let streaming = on_text.is_some();
@@ -4862,6 +4982,13 @@ impl Engine {
             reasoning_open,
             on_text.as_deref_mut(),
         );
+        let result = result.map(|(completion, kv_tokens)| {
+            let completion = Completion {
+                prompt_logprobs,
+                ..completion
+            };
+            (completion, kv_tokens)
+        });
         match result {
             Ok((completion, kv_tokens)) => {
                 // Park the instance for reuse by a follow-up request.
@@ -6401,6 +6528,18 @@ impl Engine {
     fn ram_allows_copy(bytes: u64) -> bool {
         crate::placement::available_ram_bytes()
             .is_none_or(|free| free >= LOW_MEM_FLOOR * 3 + bytes)
+    }
+
+    /// Whether a recurrent session's state after `keep` of the `len` tokens
+    /// it holds could fit the prefix cache, judged before reading the prompt
+    /// again to get it.  The state at `keep` is unknown until then: its
+    /// attention part grows with the tokens, its recurrent part does not.
+    /// The estimate scales the whole state by `keep / len`, a lower bound,
+    /// so a root that fits is never passed over; [`Engine::store_root`]
+    /// checks the real size.
+    fn root_may_fit(&self, session: &GenSession, keep: usize, len: usize) -> bool {
+        let bytes = (session.state_bytes() as u128 * keep as u128 / len.max(1) as u128) as u64;
+        self.prefix_cache().fits(bytes) && Self::ram_allows_copy(bytes)
     }
 
     /// Whether a snapshot of `session` after `keep` of its `len` tokens fits
@@ -8329,12 +8468,51 @@ fn token_logprob(logits: &[f32], token: u32, top: u32) -> crate::types::TokenLog
             best.truncate(k);
         }
     }
+    let chosen = logits.get(token as usize).copied().unwrap_or(f32::NEG_INFINITY);
+    let rank = 1 + logits.iter().filter(|v| v.is_finite() && **v > chosen).count() as u32;
     crate::types::TokenLogprob {
         token,
         logprob: logprob(token as usize),
         top: best.into_iter().map(|(id, v)| (id, v - lse)).collect(),
+        rank,
         ..Default::default()
     }
+}
+
+/// Feed one scoring window to `session` from position 0 in bounded slices
+/// ([`crate::ppl::slices`]), handing `on_rows` each slice's rows: the index
+/// in `window` of the slice's first token, the tokens from there that the
+/// rows predict (row `i` predicts `targets[i + 1]`), and the rows.  Without
+/// all-position logits the slice is fed one token at a time, and the
+/// window's last token, which nothing in it follows, is not fed.  Returns
+/// how many of the window's tokens were fed.
+fn score_window(
+    session: &mut GenSession,
+    window: &[u32],
+    all_positions: bool,
+    device: &Device,
+    on_rows: &mut dyn FnMut(usize, &[u32], &[Vec<f32>]),
+) -> Result<usize> {
+    let mut fed_to = 0;
+    for slice in crate::ppl::slices(0, window.len(), crate::ppl::SCORE_ROWS_PER_PASS) {
+        let fed = &window[slice.from..slice.to];
+        let targets = &window[slice.from..slice.target_end];
+        let rows = if all_positions {
+            session.forward_tokens_all(fed, slice.pos, device)?
+        } else {
+            let mut rows = Vec::with_capacity(fed.len());
+            for (i, tok) in fed.iter().enumerate() {
+                if slice.from + i + 1 >= slice.target_end {
+                    break;
+                }
+                rows.push(session.forward_tokens(std::slice::from_ref(tok), slice.pos + i, device)?);
+            }
+            rows
+        };
+        fed_to = slice.from + if all_positions { fed.len() } else { rows.len() };
+        on_rows(slice.from, targets, &rows);
+    }
+    Ok(fed_to)
 }
 
 /// Places each generated token's [`crate::types::TokenLogprob`] in the

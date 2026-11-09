@@ -1593,8 +1593,8 @@ async fn raw_completions_take_every_prompt_form_and_stream() {
 
     // Refused rather than ignored.
     for (extra, needle) in [
-        (serde_json::json!({"logprobs": 2, "echo": true}), "echo"),
         (serde_json::json!({"logprobs": 21}), "logprobs"),
+        (serde_json::json!({"prompt_logprobs": 21}), "prompt_logprobs"),
         (serde_json::json!({"n": 2}), "n = 1"),
         (serde_json::json!({"best_of": 3}), "best_of"),
         (serde_json::json!({"prompt": []}), "prompt"),
@@ -2079,6 +2079,168 @@ async fn logprobs_are_reported_in_each_api_shape() {
         .collect();
     let expected: Vec<serde_json::Value> = probs.iter().map(|p| p["id"].clone()).collect();
     assert_eq!(ids, expected, "{body}");
+}
+
+#[tokio::test]
+async fn prompt_logprobs_score_the_prompt_as_decoding_scores_its_tokens() {
+    let app = create_router(tiny_state("server-prompt-logprobs", None));
+    let call = |path: &'static str, body: serde_json::Value| {
+        let app = app.clone();
+        async move {
+            let res = app.oneshot(post_json(path, None, body)).await.unwrap();
+            let status = res.status();
+            let text = body_text(res).await;
+            (status, text)
+        }
+    };
+    let json = |text: &str| -> serde_json::Value { serde_json::from_str(text).unwrap() };
+
+    // Generate four tokens greedily from a token-id prompt, with their
+    // log-probabilities as decoding saw them.
+    let prompt: Vec<u64> = vec![1, 2, 3, 4];
+    let (status, body) = call(
+        "/completion",
+        serde_json::json!({
+            "prompt": prompt, "n_predict": 4, "temperature": 0.0, "ignore_eos": true,
+            "n_probs": 1, "return_tokens": true,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v = json(&body);
+    let generated: Vec<u64> =
+        v["tokens"].as_array().unwrap().iter().map(|t| t.as_u64().unwrap()).collect();
+    let decoded: Vec<f64> = v["completion_probabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["logprob"].as_f64().unwrap())
+        .collect();
+    assert_eq!(generated.len(), 4, "{body}");
+
+    // Scored as a prompt, the same tokens get the same log-probabilities.
+    let mut whole = prompt.clone();
+    whole.extend(&generated);
+    let (status, body) = call(
+        "/v1/completions",
+        serde_json::json!({
+            "model": "", "prompt": whole, "max_tokens": 1, "temperature": 0.0,
+            "ignore_eos": true, "echo": true, "logprobs": 2, "prompt_logprobs": 1,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v = json(&body);
+    let choice = &v["choices"][0];
+    let lp = &choice["logprobs"];
+    let token_logprobs = lp["token_logprobs"].as_array().unwrap();
+    // Every prompt token, then the one generated.
+    assert_eq!(token_logprobs.len(), whole.len() + 1, "{body}");
+    assert!(token_logprobs[0].is_null() && lp["top_logprobs"][0].is_null(), "{body}");
+    for (i, want) in decoded.iter().enumerate() {
+        let got = token_logprobs[prompt.len() + i].as_f64().unwrap();
+        assert!((got - want).abs() < 1e-3, "token {i}: scored {got}, decoded {want}: {body}");
+    }
+    // The generated token's offset is past the echoed prompt.
+    let echoed = choice["text"].as_str().unwrap().chars().count()
+        - lp["tokens"][whole.len()].as_str().unwrap().chars().count();
+    assert_eq!(lp["text_offset"][whole.len()], echoed, "{body}");
+    // vLLM's shape: null, then the token (with its rank) and alternatives.
+    let prompt_logprobs = choice["prompt_logprobs"].as_array().unwrap();
+    assert_eq!(prompt_logprobs.len(), whole.len(), "{body}");
+    assert!(prompt_logprobs[0].is_null(), "{body}");
+    for (i, step) in prompt_logprobs.iter().enumerate().skip(1) {
+        let entry = &step[whole[i].to_string()];
+        assert!(entry["rank"].as_u64().unwrap() >= 1, "{step}");
+        assert_eq!(entry["logprob"], token_logprobs[i], "{step}");
+        assert!(entry["decoded_token"].is_string(), "{step}");
+        assert!((1..=2).contains(&step.as_object().unwrap().len()), "{step}");
+    }
+
+    // Streamed with `echo`, the prompt's entries ride the first chunk.
+    let (status, body) = call(
+        "/v1/completions",
+        serde_json::json!({
+            "model": "", "prompt": whole, "max_tokens": 1, "temperature": 0.0,
+            "ignore_eos": true, "echo": true, "logprobs": 2, "stream": true,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let streamed: Vec<serde_json::Value> = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .filter(|d| *d != "[DONE]")
+        .flat_map(|d| {
+            let v = json(d);
+            v["choices"][0]["logprobs"]["token_logprobs"].as_array().cloned().unwrap_or_default()
+        })
+        .collect();
+    assert_eq!(&streamed, token_logprobs, "{body}");
+
+    // vLLM refuses prompt log-probabilities on a stream.
+    let (status, body) = call(
+        "/v1/completions",
+        serde_json::json!({"model": "", "prompt": "a", "stream": true, "prompt_logprobs": 1}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // A truncated prompt is scored as it was completed: its kept tail,
+    // placed at the echoed text's end.
+    let (status, body) = call(
+        "/v1/completions",
+        serde_json::json!({
+            "model": "", "prompt": whole, "max_tokens": 1, "temperature": 0.0,
+            "ignore_eos": true, "echo": true, "logprobs": 0, "prompt_logprobs": 0,
+            "truncate_prompt_tokens": 3,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v = json(&body);
+    let choice = &v["choices"][0];
+    assert_eq!(choice["prompt_logprobs"].as_array().unwrap().len(), 3, "{body}");
+    assert_eq!(v["usage"]["prompt_tokens"], 3, "{body}");
+    let offsets: Vec<u64> = choice["logprobs"]["text_offset"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o.as_u64().unwrap())
+        .collect();
+    assert_eq!(offsets.len(), 4, "{body}");
+    assert!(offsets.windows(2).all(|w| w[0] <= w[1]), "{body}");
+    let echoed = choice["text"].as_str().unwrap().chars().count() as u64
+        - choice["logprobs"]["tokens"][3].as_str().unwrap().chars().count() as u64;
+    assert_eq!(offsets[3], echoed, "{body}");
+    assert!(offsets[0] > 0, "the dropped head comes first: {body}");
+
+    // An infill's scored prompt is its template, not the echoed text.
+    let (status, body) = call(
+        "/v1/completions",
+        serde_json::json!({
+            "model": "", "prompt": "a", "suffix": "b", "echo": true, "logprobs": 1,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("suffix"), "{body}");
+
+    // Chat: the rendered prompt, one entry per prompt token.
+    let chat = serde_json::json!({
+        "model": "", "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1, "prompt_logprobs": 0,
+    });
+    let (status, body) = call("/v1/chat/completions", chat.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v = json(&body);
+    let entries = v["prompt_logprobs"].as_array().unwrap();
+    assert_eq!(entries.len() as u64, v["usage"]["prompt_tokens"].as_u64().unwrap(), "{body}");
+    assert!(entries[0].is_null() && entries[1].is_object(), "{body}");
+    let mut streamed = chat;
+    streamed["stream"] = serde_json::json!(true);
+    let (status, body) = call("/v1/chat/completions", streamed).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
 
 #[tokio::test]

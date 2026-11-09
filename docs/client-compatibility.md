@@ -14,8 +14,8 @@ real client binary is *not* covered by the test suite today — see
 
 | Endpoint | Status |
 |---|---|
-| `POST /v1/chat/completions` | ✅ streaming (SSE) + non-stream, tools (`tool_choice` none / auto / required / a named function), `response_format`, `logprobs` / `top_logprobs`, `prompt_cache_key`, reasoning as `reasoning_content` / `reasoning` (server default `--reasoning-format`) |
-| `POST /v1/completions` | ✅ raw prompt (no chat template): a string, token ids, or a batch of either (one choice each); SSE streaming, `echo`, `suffix` (fill-in-the-middle models), `response_format`, `add_special_tokens`, `logprobs` (the generated tokens'; `echo` with `logprobs`, which asks for the prompt's, is refused for now). `n > 1` and `best_of > 1` are refused |
+| `POST /v1/chat/completions` | ✅ streaming (SSE) + non-stream, tools (`tool_choice` none / auto / required / a named function), `response_format`, `logprobs` / `top_logprobs`, vLLM's `prompt_logprobs` (not streamed, as vLLM), `prompt_cache_key`, reasoning as `reasoning_content` / `reasoning` (server default `--reasoning-format`) |
+| `POST /v1/completions` | ✅ raw prompt (no chat template): a string, token ids, or a batch of either (one choice each); SSE streaming, `echo`, `suffix` (fill-in-the-middle models), `response_format`, `add_special_tokens`, `logprobs` (the generated tokens', and with `echo` the prompt's too), vLLM's `prompt_logprobs` (not streamed, as vLLM). `n > 1` and `best_of > 1` are refused |
 | `POST /v1/embeddings` | ✅ `input` as text, token ids or an array of either; `encoding_format` `float` or `base64` (the SDKs' default); `dimensions` (a prefix, L2-normalized again: meaningful for Matryoshka models); vLLM's `add_special_tokens`. vLLM's `normalize: false` is refused |
 | `GET /v1/models` (also `/models`), `GET /v1/models/{id}` | ✅ loaded models, plus the files the model directory holds (each with its limits; a request naming one loads it on first use) |
 | `POST /v1/audio/transcriptions`, `/v1/audio/translations` | ✅ when the server has a `--whisper-model`; translations give English |
