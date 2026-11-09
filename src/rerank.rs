@@ -105,13 +105,21 @@ pub async fn rerank(
     }
     check_embedding_inputs(req.documents.len())?;
     let (model, engine) = select_model(&state, &req.model).await?;
-    let pairs: Vec<(String, String)> = req
-        .documents
-        .iter()
-        .map(|document| (req.query.clone(), document.text().to_string()))
-        .collect();
-    let (scores, tokens) =
-        score_pairs(&state, &engine, &headers, pairs, req.instruction.clone()).await?;
+    let documents: Arc<Vec<String>> = Arc::new(
+        req.documents
+            .iter()
+            .map(|document| document.text().to_string())
+            .collect(),
+    );
+    let (scores, tokens) = score_pairs(
+        &state,
+        &engine,
+        &headers,
+        vec![req.query.clone()],
+        Arc::clone(&documents),
+        req.instruction.clone(),
+    )
+    .await?;
     let mut ranked: Vec<(usize, f32)> = scores.into_iter().enumerate().collect();
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     ranked.truncate(req.top_n.unwrap_or(ranked.len()));
@@ -121,7 +129,7 @@ pub async fn rerank(
         .map(|(index, score)| {
             let mut result = json!({ "index": index, "relevance_score": score });
             if with_documents {
-                result["document"] = json!({ "text": req.documents[index].text() });
+                result["document"] = json!({ "text": documents[index] });
             }
             result
         })
@@ -148,23 +156,24 @@ pub async fn score(
             "`text_1` and `text_2` must not be empty",
         ));
     }
-    let pairs: Vec<(String, String)> = if first.len() == 1 {
-        second
-            .into_iter()
-            .map(|text| (first[0].clone(), text))
-            .collect()
-    } else if first.len() == second.len() {
-        first.into_iter().zip(second).collect()
-    } else {
+    if first.len() != 1 && first.len() != second.len() {
         return Err(ApiError::bad_request(format!(
             "`text_1` has {} texts and `text_2` {}: give one `text_1`, or as many as `text_2`",
             first.len(),
             second.len()
         )));
-    };
-    check_embedding_inputs(pairs.len())?;
+    }
+    check_embedding_inputs(second.len())?;
     let (model, engine) = select_model(&state, &req.model).await?;
-    let (scores, tokens) = score_pairs(&state, &engine, &headers, pairs, req.instruction).await?;
+    let (scores, tokens) = score_pairs(
+        &state,
+        &engine,
+        &headers,
+        first,
+        Arc::new(second),
+        req.instruction,
+    )
+    .await?;
     let data: Vec<Value> = scores
         .into_iter()
         .enumerate()
@@ -180,13 +189,17 @@ pub async fn score(
     })))
 }
 
-/// Run [`Engine::rerank`] off the async runtime, stopping it if the client
-/// goes away, and count the prompt tokens it read.
+/// Run [`Engine::rerank`] off the async runtime on each document paired
+/// with its query (the one query, or the query at the document's index),
+/// stopping if the client goes away, and count the prompt tokens it read.
+/// The pairs borrow the texts, so a long query shared by many documents is
+/// held once.
 async fn score_pairs(
     state: &AppState,
     engine: &Arc<Engine>,
     headers: &HeaderMap,
-    pairs: Vec<(String, String)>,
+    queries: Vec<String>,
+    documents: Arc<Vec<String>>,
     instruction: Option<String>,
 ) -> Result<(Vec<f32>, u32), ApiError> {
     let options = GenerationOptions {
@@ -197,7 +210,21 @@ async fn score_pairs(
     let (scores, tokens) = tokio::task::spawn_blocking({
         let engine = Arc::clone(engine);
         let flag = cancel.flag();
-        move || engine.rerank(&pairs, instruction.as_deref(), &options, Some(&flag))
+        move || {
+            let pairs: Vec<(&str, &str)> = documents
+                .iter()
+                .enumerate()
+                .map(|(i, document)| {
+                    let query = if queries.len() == 1 {
+                        &queries[0]
+                    } else {
+                        &queries[i]
+                    };
+                    (query.as_str(), document.as_str())
+                })
+                .collect();
+            engine.rerank(&pairs, instruction.as_deref(), &options, Some(&flag))
+        }
     })
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?

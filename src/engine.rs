@@ -3682,7 +3682,7 @@ impl Engine {
     /// tokens is refused, as is a set `cancel`.
     pub fn rerank(
         &self,
-        pairs: &[(String, String)],
+        pairs: &[(&str, &str)],
         instruction: Option<&str>,
         options: &GenerationOptions,
         cancel: Option<&AtomicBool>,
