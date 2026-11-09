@@ -2482,3 +2482,143 @@ async fn responses_report_reasoning_as_its_own_item() {
     assert_eq!(last["type"], "response.incomplete", "{body}");
     assert_eq!(last["response"]["output"][0]["content"][0]["text"], text.as_str());
 }
+
+/// A tiny model whose vocabulary spells `k` and `l` as `yes` and `no`, the
+/// tokens a generative reranker answers with.
+fn rerank_state(dir_name: &str) -> Arc<ServerState> {
+    let dir = model_dir(dir_name);
+    let tokenizer = common::TOKENIZER_JSON
+        .replace("\"k\": 14", "\"yes\": 14")
+        .replace("\"l\": 15", "\"no\": 15");
+    std::fs::write(dir.join("tokenizer.json"), tokenizer).unwrap();
+    write_tiny_llama_gguf(&dir.join("model.gguf"));
+    let engine = Engine::with_n_ctx(&dir, 512).expect("engine should load tiny model");
+    Arc::new(ServerState::new(Arc::new(engine)))
+}
+
+/// `/v1/rerank` ranks the documents by the chance the model answers `yes`,
+/// and `/v1/score` gives the same scores in input order, whether the query
+/// is broadcast or paired, and whether or not its prompt head is reused.
+#[tokio::test]
+async fn rerank_and_score_rank_documents_by_the_yes_logit() {
+    let json = |text: &str| -> serde_json::Value { serde_json::from_str(text).unwrap() };
+    let app = create_router(rerank_state("rerank"));
+    let documents = ["c d", "e f", "g h i"];
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/v1/score",
+        Some(serde_json::json!({ "model": "model", "text_1": "a b", "text_2": documents })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let scored = json(&body);
+    assert_eq!(scored["object"], "list", "{body}");
+    let scores: Vec<f64> = scored["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            assert_eq!(entry["index"], i, "{body}");
+            assert_eq!(entry["object"], "score", "{body}");
+            entry["score"].as_f64().unwrap()
+        })
+        .collect();
+    assert_eq!(scores.len(), 3, "{body}");
+    assert!(scores.iter().all(|s| *s > 0.0 && *s < 1.0), "{body}");
+    assert!(scored["usage"]["prompt_tokens"].as_u64().unwrap() > 0, "{body}");
+
+    // The same pairs given one by one score the same.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/score",
+        Some(serde_json::json!({ "text_1": ["a b", "a b"], "text_2": ["e f", "c d"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let paired = json(&body);
+    let close = |a: f64, b: f64| (a - b).abs() < 1e-5;
+    assert!(close(paired["data"][0]["score"].as_f64().unwrap(), scores[1]), "{body}");
+    assert!(close(paired["data"][1]["score"].as_f64().unwrap(), scores[0]), "{body}");
+
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/v1/rerank",
+        Some(serde_json::json!({
+            "model": "model",
+            "query": "a b",
+            "documents": ["c d", { "text": "e f" }, "g h i"],
+            "top_n": 2,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ranked = json(&body);
+    let results = ranked["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2, "{body}");
+    let mut order: Vec<usize> = (0..3).collect();
+    order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
+    for (result, &index) in results.iter().zip(&order) {
+        assert_eq!(result["index"], index, "{body}");
+        assert!(close(result["relevance_score"].as_f64().unwrap(), scores[index]), "{body}");
+        assert_eq!(result["document"]["text"], documents[index], "{body}");
+    }
+    assert!(ranked["usage"]["total_tokens"].as_u64().unwrap() > 0, "{body}");
+
+    // Cohere's spelling, without the documents echoed.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/v2/rerank",
+        Some(serde_json::json!({
+            "query": "a b", "documents": documents, "return_documents": false,
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ranked = json(&body);
+    assert_eq!(ranked["results"].as_array().unwrap().len(), 3, "{body}");
+    assert!(ranked["results"][0].get("document").is_none(), "{body}");
+
+    // A different instruction asks a different question.
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/v1/score",
+        Some(serde_json::json!({
+            "text_1": "a b", "text_2": "c d", "instruction": "j",
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!close(json(&body)["data"][0]["score"].as_f64().unwrap(), scores[0]), "{body}");
+
+    for (uri, request) in [
+        ("/v1/rerank", serde_json::json!({ "query": "a", "documents": [] })),
+        ("/v1/rerank", serde_json::json!({ "query": "a", "documents": ["b"], "top_n": 0 })),
+        ("/v1/score", serde_json::json!({ "text_1": ["a", "b"], "text_2": ["c", "d", "e"] })),
+        ("/v1/score", serde_json::json!({ "text_1": [], "text_2": "c" })),
+    ] {
+        let (status, body) = call(&app, "POST", uri, Some(request)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+    }
+}
+
+/// A model with no `yes` and `no` tokens cannot rerank.
+#[tokio::test]
+async fn rerank_refuses_a_model_without_yes_and_no_tokens() {
+    let app = create_router(tiny_state("rerank-refused", None));
+    let (status, body) = call(
+        &app,
+        "POST",
+        "/v1/rerank",
+        Some(serde_json::json!({ "query": "a", "documents": ["b"] })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("`yes` and `no`"), "{body}");
+}
