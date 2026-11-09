@@ -2852,4 +2852,7 @@ async fn ollama_context_closes_the_earlier_answer() {
     let next = generate(serde_json::json!({"prompt": "c", "context": first})).await;
     // hello (closing the answer), c, hello, world, then the new answer.
     assert_eq!(&next[first.len()..first.len() + 4], &[1, 6, 1, 2], "{next:?}");
+    // A new system message stays in the new turn: hello, d, hello, c, ...
+    let next = generate(serde_json::json!({"prompt": "c", "system": "d", "context": first})).await;
+    assert_eq!(&next[first.len()..first.len() + 6], &[1, 7, 1, 6, 1, 2], "{next:?}");
 }

@@ -875,13 +875,19 @@ enum Ready {
 }
 
 /// Ollama's context shift for a continued conversation: when the earlier
-/// tokens and a new turn of `turn` tokens would fill the `window`, the
-/// oldest earlier tokens are dropped (keeping a leading `bos`) until a
-/// quarter of the window is left for the answer.  A turn too long for that
-/// is left for generation to refuse.
-fn shift_context(context: Vec<u32>, turn: usize, window: usize, bos: Option<u32>) -> Vec<u32> {
-    let budget = window - window / 4;
-    if context.len() + turn < window || turn >= budget {
+/// tokens and a new turn of `turn` tokens leave less than `answer` tokens
+/// of the `window` for the answer, the oldest earlier tokens are dropped
+/// (keeping a leading `bos`) until that much is free.  A turn too long for
+/// that is left for generation to refuse.
+fn shift_context(
+    context: Vec<u32>,
+    turn: usize,
+    window: usize,
+    answer: usize,
+    bos: Option<u32>,
+) -> Vec<u32> {
+    let budget = window.saturating_sub(answer.min(window / 4).max(1));
+    if context.len() + turn <= budget || turn >= budget {
         return context;
     }
     let head = usize::from(bos.is_some() && context.first() == bos.as_ref());
@@ -942,7 +948,13 @@ impl Plan {
             Source::Continue { context, messages } => {
                 let turn = engine.tokenize_chat_turn(&messages, &options)?;
                 let window = options.context_window.unwrap_or(engine.n_ctx()) as usize;
-                let mut tokens = shift_context(context, turn.len(), window, engine.bos_token());
+                // Room for the answer: what was asked for, up to a quarter
+                // of the window.
+                let answer = match options.max_tokens {
+                    crate::types::MAX_TOKENS_UNLIMITED => window / 4,
+                    n => n as usize,
+                };
+                let mut tokens = shift_context(context, turn.len(), window, answer, engine.bos_token());
                 tokens.extend(turn);
                 let prompt = RawPrompt::tokens(tokens.clone());
                 (Ready::Raw { prompt, split: true }, Some(tokens))
@@ -1870,14 +1882,16 @@ mod tests {
     #[test]
     fn a_full_context_drops_its_oldest_tokens() {
         let context: Vec<u32> = (0..10).collect();
-        // Room to spare: nothing is dropped.
-        assert_eq!(shift_context(context.clone(), 2, 16, Some(0)), context);
-        // Full: the BOS stays, then the newest tokens, leaving a quarter of
-        // the window (4 of 16) for the answer.
-        assert_eq!(shift_context(context.clone(), 6, 16, Some(0)), vec![0, 5, 6, 7, 8, 9]);
+        // Room to spare for a 4-token answer: nothing is dropped.
+        assert_eq!(shift_context(context.clone(), 2, 16, 4, Some(0)), context);
+        // Too little: the BOS stays, then the newest tokens, leaving the 4
+        // the answer asks for.
+        assert_eq!(shift_context(context.clone(), 5, 16, 4, Some(0)), vec![0, 4, 5, 6, 7, 8, 9]);
         // Without a leading BOS only the newest are kept.
-        assert_eq!(shift_context(context.clone(), 6, 16, None), (4..10).collect::<Vec<u32>>());
+        assert_eq!(shift_context(context.clone(), 6, 16, 4, None), (4..10).collect::<Vec<u32>>());
+        // An answer asked to be longer gets a quarter of the window.
+        assert_eq!(shift_context(context.clone(), 6, 16, 100, None), (4..10).collect::<Vec<u32>>());
         // A turn too long to leave room is left alone.
-        assert_eq!(shift_context(context.clone(), 12, 16, Some(0)), context);
+        assert_eq!(shift_context(context.clone(), 12, 16, 4, Some(0)), context);
     }
 }

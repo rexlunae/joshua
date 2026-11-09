@@ -3971,26 +3971,27 @@ impl Engine {
     /// chat template puts after an answer and before the new turn's
     /// generation prompt, so the earlier answer is closed as a whole
     /// conversation would close it.  It is rendered after a stand-in
-    /// exchange and cut after the stand-in answer; a template that does not
-    /// show that answer gets the turn alone, without the BOS its template
-    /// puts first (the earlier tokens already start with it).  The
-    /// tokenizer adds no special tokens either way.
+    /// exchange and cut after the stand-in answer, so a new system message
+    /// stays in the turn.  A template that does not show that answer, or
+    /// will not render a system message there, gets the turn alone, without
+    /// the BOS its template puts first (the earlier tokens already start
+    /// with it).  The tokenizer adds no special tokens either way.
     pub fn tokenize_chat_turn(
         &self,
         messages: &[ChatMessage],
         options: &GenerationOptions,
     ) -> Result<Vec<u32>> {
         const ANSWER: &str = "\u{E000}joshua-earlier-answer\u{E000}";
-        let (system, turn): (Vec<ChatMessage>, Vec<ChatMessage>) =
-            messages.iter().cloned().partition(|m| m.role == "system");
-        let mut conversation = system;
-        conversation.push(ChatMessage::text("user", "\u{E000}"));
-        conversation.push(ChatMessage::text("assistant", ANSWER));
-        conversation.extend(turn);
+        let mut conversation = vec![
+            ChatMessage::text("user", "\u{E000}"),
+            ChatMessage::text("assistant", ANSWER),
+        ];
+        conversation.extend(messages.iter().cloned());
         let (conversation, tools) = self.stable_chat(&conversation, None, false);
-        let rendered = self.render_chat(&conversation, tools.as_deref(), options)?;
-        if let Some(at) = rendered.text.find(ANSWER) {
-            return self.tokenize(&rendered.text[at + ANSWER.len()..], false);
+        if let Ok(rendered) = self.render_chat(&conversation, tools.as_deref(), options) {
+            if let Some(at) = rendered.text.find(ANSWER) {
+                return self.tokenize(&rendered.text[at + ANSWER.len()..], false);
+            }
         }
         let (messages, tools) = self.stable_chat(messages, None, false);
         let rendered = self.render_chat(&messages, tools.as_deref(), options)?;
