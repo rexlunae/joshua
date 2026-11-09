@@ -421,7 +421,17 @@ fn show_response(info: &ModelInfo, engine: Option<&Engine>) -> ShowResponse {
         template,
         details,
         model_info: model_info(info),
-        capabilities: engine.map_or_else(|| vec!["completion".to_string()], capabilities),
+        capabilities: engine.map_or_else(
+            || vec!["completion".to_string()],
+            |e| {
+                let mut caps = capabilities(e);
+                // `embed` refuses an adapter model: it pools the base alone.
+                if info.parent.is_some() {
+                    caps.retain(|c| c != "embedding");
+                }
+                caps
+            },
+        ),
         modified_at: modified_at(info.path.as_deref()),
     }
 }
@@ -1639,9 +1649,13 @@ pub async fn copy(
                 "`{dest}` is a model; delete it before copying an adapter model to its name"
             )));
         }
+        refuse_runtime_adapter(&state, stem)?;
         let dir = model_dir_of(&state)?;
         crate::ollama_pull::copy_adapter(&dir, strip_tag(source), stem)
             .map_err(|e| ApiError::internal(format!("copying `{source}`: {e}")))?;
+        // A destination adapter already loaded holds its old weights; the
+        // next request loads the copied files.
+        unload_adapter(&state, stem).await?;
         return Ok(StatusCode::OK);
     }
     if !from.exists() {
@@ -1723,6 +1737,27 @@ fn model_dir_of(state: &AppState) -> Result<PathBuf, ApiError> {
 /// serves; a `files` base is refused (create the base first, then the
 /// adapter model `from` it).  A loaded adapter of the same name made this
 /// way is let go, so the next request loads the new one.
+/// Refuse to write the adapter model `stem` over a LoRA adapter of that
+/// name that a runtime load (not an adapter model's first use) put on an
+/// engine: the new files would sit behind an adapter they do not describe.
+fn refuse_runtime_adapter(state: &AppState, stem: &str) -> Result<(), ApiError> {
+    if let Some((engine, _)) = state.models.adapter(stem) {
+        let ours = state.adapter_model(stem).is_some_and(|created| {
+            engine
+                .lora_adapters()
+                .iter()
+                .any(|a| a.name == stem && a.path == created.path)
+        });
+        if !ours {
+            return Err(ApiError::bad_request(format!(
+                "a LoRA adapter named `{stem}` is already loaded; unload it or give the adapter \
+                 model another name"
+            )));
+        }
+    }
+    Ok(())
+}
+
 async fn create_adapter_model(
     state: &AppState,
     name: &str,
@@ -1754,20 +1789,7 @@ async fn create_adapter_model(
             "`{name}` is a model; delete it first or give the adapter model another name"
         )));
     }
-    if let Some((engine, _)) = state.models.adapter(&stem) {
-        let ours = state.adapter_model(&stem).is_some_and(|created| {
-            engine
-                .lora_adapters()
-                .iter()
-                .any(|a| a.name == stem && a.path == created.path)
-        });
-        if !ours {
-            return Err(ApiError::bad_request(format!(
-                "a LoRA adapter named `{stem}` is already loaded; unload it or give the adapter \
-                 model another name"
-            )));
-        }
-    }
+    refuse_runtime_adapter(state, &stem)?;
     let lines = tokio::task::spawn_blocking({
         let (state, stem, base, body) = (Arc::clone(state), stem.clone(), base.clone(), body.clone());
         move || crate::ollama_pull::create_adapter(&state, &stem, &base, &body)

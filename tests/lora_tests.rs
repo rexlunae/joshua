@@ -1547,6 +1547,7 @@ async fn ollama_create_with_an_adapter_serves_it_as_a_model() {
             #[cfg(feature = "distributed")]
             cluster_key: None,
         }),
+        allow_runtime_lora: true,
         ..ServerState::new(Arc::clone(&engine))
     }));
     let call = |method: &str, uri: &str, body: Body| {
@@ -1605,6 +1606,13 @@ async fn ollama_create_with_an_adapter_serves_it_as_a_model() {
     assert_eq!(status, StatusCode::OK);
     assert!(show["modelfile"].as_str().unwrap().contains("FROM model\nADAPTER "), "{show}");
     assert_eq!(show["details"]["parent_model"], "model");
+    // `embed` refuses an adapter model, so it does not claim embeddings.
+    let caps = show["capabilities"].as_array().unwrap();
+    assert!(caps.contains(&json!("completion")) && !caps.contains(&json!("embedding")), "{show}");
+    // A runtime adapter cannot take a created adapter model's name.
+    let (status, body) = json_call("POST", "/v1/load_lora_adapter", json!({"lora_name": "tuned", "lora_path": scratch.join("style.gguf")})).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(engine.lora_id("tuned"), None);
 
     // A router admits it on its base's slots before it is loaded.
     let (_, info) = json_call("GET", "/v1/worker/info", Value::Null).await;
@@ -1625,11 +1633,14 @@ async fn ollama_create_with_an_adapter_serves_it_as_a_model() {
     let (_, models) = json_call("GET", "/v1/models", Value::Null).await;
     assert!(names(&models, "data").contains(&"model".to_string()));
 
-    // A PEFT adapter, as `ADAPTER ./dir` uploads it.
+    // A PEFT adapter, as `ADAPTER ./dir` uploads it, with a file the
+    // adapter does not use.
     let weights_digest = upload(weights).await;
     let config_digest = upload(config).await;
+    let readme_digest = upload(b"{}".to_vec()).await;
     let (status, body) = create(json!({"model": "peft", "from": "model", "adapters": {
-        "adapter_model.safetensors": weights_digest, "adapter_config.json": config_digest}, "stream": false})).await;
+        "adapter_model.safetensors": weights_digest, "adapter_config.json": config_digest,
+        "tokenizer_config.json": readme_digest}, "stream": false})).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let (status, body) = generate("peft").await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -1640,6 +1651,18 @@ async fn ollama_create_with_an_adapter_serves_it_as_a_model() {
     assert_eq!(status, StatusCode::OK);
     let (status, _) = generate("tuned2").await;
     assert_eq!(status, StatusCode::OK);
+    // Copying over a loaded adapter model lets its old weights go, so the
+    // next request loads the copied ones.
+    let peft_before = engine.lora_adapters().into_iter().find(|a| a.name == "peft").unwrap();
+    let (status, _) = json_call("POST", "/api/copy", json!({"source": "tuned", "destination": "peft"})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(engine.lora_id("peft"), None);
+    let (status, _) = generate("peft").await;
+    assert_eq!(status, StatusCode::OK);
+    // It was a PEFT directory; it is now the copied GGUF adapter.
+    let peft_after = engine.lora_adapters().into_iter().find(|a| a.name == "peft").unwrap();
+    assert_ne!(peft_after.path, peft_before.path);
+    assert!(peft_after.path.ends_with("adapter"), "{}", peft_after.path.display());
     for name in ["tuned", "tuned2", "peft"] {
         let (status, _) = json_call("DELETE", "/api/delete", json!({"model": name})).await;
         assert_eq!(status, StatusCode::OK, "{name}");

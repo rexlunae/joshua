@@ -916,6 +916,16 @@ pub fn create_adapter(state: &AppState, stem: &str, base: &str, body: &Value) ->
         .values()
         .map(|digest| json!({ "status": format!("using existing layer {}", digest.as_str().unwrap_or_default()) }))
         .collect();
+    // A client may upload an adapter directory's other files (its tokenizer
+    // JSON, say), which the adapter does not use: they are not kept, and the
+    // status says so rather than dropping them silently.
+    let used = |n: &str| n.ends_with(".gguf") || n.ends_with(".safetensors") || n == "adapter_config.json";
+    lines.extend(
+        adapters
+            .keys()
+            .filter(|name| !used(&file_name(name)))
+            .map(|name| json!({ "status": format!("skipping {name}: not part of a LoRA adapter") })),
+    );
     lines.push(json!({ "status": "writing manifest" }));
     lines.push(json!({ "status": "success" }));
     Ok(lines)

@@ -115,6 +115,13 @@ pub async fn vllm_load(
             "'{name}' is a model's id; an adapter needs a name of its own"
         )));
     }
+    // An adapter model Ollama's create made owns its name too, loaded or
+    // not: a runtime adapter of that name would run in its place.
+    if state.adapter_model(&name).is_some() {
+        return Err(ApiError::bad_request(format!(
+            "'{name}' is an adapter model; an adapter needs a name of its own"
+        )));
+    }
     let replace = match state.models.adapter(&name) {
         Some((owner, _)) if !Arc::ptr_eq(&owner, &engine) => {
             return Err(ApiError::bad_request(format!(
