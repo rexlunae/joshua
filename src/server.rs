@@ -1242,7 +1242,13 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/delete", delete(crate::ollama::delete))
         .route("/api/copy", post(crate::ollama::copy))
         .route("/api/create", post(crate::ollama::create))
-        .route("/api/pull", post(crate::ollama::pull))
+        .route("/api/pull", post(crate::ollama_pull::pull))
+        .route(
+            "/api/blobs/{digest}",
+            axum::routing::head(crate::ollama_pull::blob_exists)
+                .post(crate::ollama_pull::upload_blob)
+                .layer(axum::extract::DefaultBodyLimit::disable()),
+        )
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             require_api_key,

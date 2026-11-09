@@ -20,21 +20,16 @@
 //! OpenAI routes use.
 //!
 //! **Model management** (`/api/delete`, `/api/copy`, `/api/create`,
-//! `/api/pull`) is provided against the model *directory* rather than Ollama's
-//! content-addressed blob store, so scripts that manage models through the API
-//! keep working:
+//! `/api/pull`, `/api/blobs`) works against the model *directory*, so
+//! scripts that manage models through the API keep working:
 //!
 //! * `delete` / `copy` / `create` (the `from` form) act on `<name>.gguf` inside
 //!   the model directory.  Names are confined to that directory — `..`,
 //!   absolute paths and names that canonicalise outside it are rejected,
 //!   because these endpoints delete and overwrite files.
-//! * `create` with `files` (SHA256 blob digests) is **rejected**, not ignored:
-//!   there is no blob store to name files in.
-//! * `pull` does not speak the Ollama registry protocol, so a bare library name
-//!   such as `llama3` fails with guidance instead of hanging.  Place the
-//!   `.gguf` in the model directory and use `POST /v1/models/load`, or move the
-//!   file in by hand.  An explicit `https://` URL is answered with a 501:
-//!   URL downloads are not implemented.
+//! * `pull` fetches from an Ollama registry or an https URL, `/api/blobs`
+//!   keeps uploads in a small blob store, and `create` with `files` places
+//!   an uploaded GGUF as a model: see [`crate::ollama_pull`].
 //!
 //! Ollama's `:tag` suffix names a manifest, which has no joshua equivalent:
 //! a name whose tag is not part of a model id resolves to the id without it,
@@ -1582,68 +1577,52 @@ pub async fn copy(
 
 /// `POST /api/create` — create a model.
 ///
-/// Only the `from` form is meaningful without a blob store: it copies an
-/// existing model under a new name (Ollama's "derive a model from another").
-/// The `files` form names blobs by SHA256, which joshua has no store for, so it
-/// is rejected explicitly instead of being ignored.
+/// The `from` form copies an existing model under a new name (Ollama's
+/// "derive a model from another").  The `files` form names a GGUF blob
+/// uploaded with `POST /api/blobs/{digest}` and places it in the model
+/// directory (see [`crate::ollama_pull`]).  Either answers with Ollama's
+/// status lines, streamed unless `stream` is false.
 pub async fn create(
     State(state): State<AppState>,
     Json(body): Json<serde_json::Value>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<axum::response::Response, ApiError> {
     let name = body
         .get("model")
         .and_then(|v| v.as_str())
         .ok_or_else(|| ApiError::bad_request("missing 'model'"))?;
-    if body.get("files").is_some() {
-        return Err(ApiError::bad_request(
-            "creating from blob digests is not supported: joshua reads plain .gguf              files from its model directory, so put the file there and use \
-             `\"from\": \"<name>\"` or POST /v1/models/load instead",
-        ));
+    let stream = body.get("stream").and_then(|v| v.as_bool()).unwrap_or(true);
+    let to = model_file(&state, name)?;
+    if body.get("files").is_some_and(|v| !v.is_null()) {
+        let stem = to
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| ApiError::bad_request("invalid model name"))?
+            .to_string();
+        let lines = crate::ollama_pull::create_from_files(&state, &stem, &body)?;
+        return Ok(crate::ollama_pull::status_response(lines, stream));
     }
     let source = body.get("from").and_then(|v| v.as_str()).ok_or_else(|| {
-        ApiError::bad_request("missing 'from': joshua cannot build a model from template parameters alone")
+        ApiError::bad_request("missing 'from' or 'files': joshua cannot build a model from template parameters alone")
     })?;
     let from = model_file(&state, source)?;
-    let to = model_file(&state, name)?;
     if !from.exists() {
         return Err(ApiError::new(
             StatusCode::NOT_FOUND,
-            &format!("model `{source}` not found"),
+            format!("model `{source}` not found"),
             "model_not_found",
         ));
     }
-    std::fs::copy(&from, &to)
-        .map_err(|e| ApiError::internal(format!("writing {}: {e}", to.display())))?;
-    Ok(StatusCode::OK)
-}
-
-/// `POST /api/pull` — fetch a model file from an explicit https URL.
-///
-/// Neither source is implemented yet.  Ollama's registry protocol
-/// (`model:tag` resolved against its library) needs the registry
-/// manifest/blob API, which joshua does not speak, so a bare library name
-/// fails with a 400 and guidance rather than hanging; an explicit https URL
-/// is answered with a 501 until URL downloads land.  Either way the client
-/// is told to place the file in the model directory and load it.
-pub async fn pull(
-    Json(body): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let name = body
-        .get("model")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| ApiError::bad_request("missing 'model'"))?;
-    if !name.starts_with("https://") {
-        return Err(ApiError::bad_request(&format!(
-            "cannot pull `{name}`: joshua does not implement the Ollama registry protocol. \
-             Place the .gguf file in the model directory and load it with \
-             POST /v1/models/load."
-        )));
+    if from != to {
+        std::fs::copy(&from, &to)
+            .map_err(|e| ApiError::internal(format!("writing {}: {e}", to.display())))?;
     }
-    Err(ApiError::new(
-        StatusCode::NOT_IMPLEMENTED,
-        "downloading from a URL is not implemented yet; place the .gguf in the model \
-         directory and POST /v1/models/load",
-        "pull_not_implemented",
+    Ok(crate::ollama_pull::status_response(
+        vec![
+            serde_json::json!({ "status": "using existing layer" }),
+            serde_json::json!({ "status": "writing manifest" }),
+            serde_json::json!({ "status": "success" }),
+        ],
+        stream,
     ))
 }
 

@@ -107,8 +107,9 @@ supported.
 | `DELETE /api/delete` | ✅ removes `<name>.gguf` from the model directory |
 | `POST /api/copy` | ✅ |
 | `POST /api/create` (`from:`) | ✅ derives from an existing model |
-| `POST /api/create` (`files:`) | ❌ rejected explicitly — no blob store |
-| `POST /api/pull` | ❌ not implemented — see below |
+| `POST /api/create` (`files:`) | ✅ places one uploaded GGUF blob as `<model>.gguf`; Modelfile settings (`template`, `system`, `parameters`, `messages`, `adapters`, `quantize`) are refused |
+| `HEAD`/`POST /api/blobs/{digest}` | ✅ uploads checked against their SHA-256, kept in `<model dir>/.blobs` |
+| `POST /api/pull` | ✅ from registry.ollama.ai, another registry speaking its protocol (`hf.co/...`), or an `https://` `.gguf` URL — see below |
 | `POST /api/push` | ❌ no registry |
 
 Generation `options` honoured on `/api/chat` and `/api/generate`:
@@ -156,21 +157,25 @@ What the rest of a request and its answer carry:
   request can be checked up front, and as a final `{"error": ...}` line when
   generation fails mid-stream.
 
-### Why `pull` is not simply "missing"
+### `pull`
 
-Ollama's `pull` is not a file download: it fetches a **manifest** from
-`registry.ollama.ai`, then layers addressed by SHA256 digest, resuming partial
-downloads across concurrent callers. Supporting `ollama pull llama3` means
-implementing that registry protocol, not adding a route. The endpoint returns
-guidance rather than hanging:
+`pull` reads a name the way Ollama does, `[host/][namespace/]model[:tag]`
+(`registry.ollama.ai`, `library` and `latest` by default), fetches the
+manifest and downloads its model layer, checking it against the layer's
+SHA-256 digest before it is placed as `<model>.gguf` (the tag and namespace
+are dropped, as everywhere on the Ollama routes).  A blob already in the blob
+store is reused.  The manifest's template, parameters and system layers are
+not used, as joshua renders the GGUF's own template; projector and adapter
+layers are skipped with a status line saying so.  An `https://` URL ending in
+`.gguf` is downloaded as it is, and must start with GGUF's magic.  Plain
+`http://` needs `insecure: true`.  Progress streams as Ollama's
+newline-delimited status lines (`stream: false` answers once, at the end).
+Interrupted downloads start again rather than resuming.
 
-> cannot pull `llama3`: joshua does not implement the Ollama registry protocol.
-> Place the .gguf file in the model directory and load it with
-> POST /v1/models/load.
-
-Explicit-URL downloading is itself still unimplemented (returns 501); adding an
-HTTP client is a separate decision because it introduces outbound network
-access into the server.
+The download half sits behind the `pull` cargo feature, on by default; a
+server built without it answers `pull` with a 501 and the advice to place
+the file in the model directory.  Like the other management routes, `pull`,
+`create` and the blob routes need a server that manages a model directory.
 
 ### Management-endpoint safety
 
