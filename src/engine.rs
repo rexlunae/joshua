@@ -5389,12 +5389,13 @@ impl Engine {
             // Recorded before the token's text is released, so a streaming
             // caller finds it with that text.
             if let (Some(top), Some(placer)) = (options.logprobs, placer.as_mut()) {
-                let mut entry = token_logprob(&logits_vec, next_token, top);
-                placer.place(&text.response, text.stable, &mut entry);
-                if let Some(sink) = &options.logprob_sink {
-                    sink.push(entry.clone());
+                let entry = token_logprob(&logits_vec, next_token, top);
+                for entry in placer.place(&text.response, text.stable, entry) {
+                    if let Some(sink) = &options.logprob_sink {
+                        sink.push(entry.clone());
+                    }
+                    logprobs.push(entry);
                 }
-                logprobs.push(entry);
             }
             sampler.accept(next_token);
             if let Some(r) = reasoning.as_mut() {
@@ -5590,6 +5591,12 @@ impl Engine {
             pool.release(d.session);
         }
 
+        for entry in placer.as_mut().map(LogprobPlacer::finish).unwrap_or_default() {
+            if let Some(sink) = &options.logprob_sink {
+                sink.push(entry.clone());
+            }
+            logprobs.push(entry);
+        }
         if stop_type == StopType::Word {
             // The tokens of a stop sequence trimmed from the text go with it.
             logprobs.retain(|e: &crate::types::TokenLogprob| e.start < text.response.len());
@@ -8338,6 +8345,11 @@ fn token_logprob(logits: &[f32], token: u32, top: u32) -> crate::types::TokenLog
 /// counts, while tags (whole or in pieces), reasoning, harmony headers and
 /// dropped whitespace do not.  A token that adds no text yet (part of a
 /// character) goes by whether the block is open.
+///
+/// While the splitter cannot tell yet what the output is (it may still
+/// open a block, or a harmony header is being read), the tokens it holds
+/// wait: they are answer if their text comes out as answer once it
+/// decides, which shows as more answer text than the deciding token wrote.
 struct LogprobPlacer {
     /// `chars` characters make up the text's first `bytes` bytes.
     bytes: usize,
@@ -8345,6 +8357,8 @@ struct LogprobPlacer {
     splitter: crate::reasoning::ReasoningSplitter,
     /// How much of the text the splitter has been given.
     fed: usize,
+    /// Tokens whose text the splitter holds undecided.
+    pending: Vec<crate::types::TokenLogprob>,
 }
 
 impl LogprobPlacer {
@@ -8354,12 +8368,20 @@ impl LogprobPlacer {
             chars: 0,
             splitter: crate::reasoning::ReasoningSplitter::new(format, reasoning_open),
             fed: 0,
+            pending: Vec::new(),
         }
     }
 
     /// Place the token just appended to `response`, which left its first
-    /// `stable` bytes as they were.
-    fn place(&mut self, response: &str, stable: usize, entry: &mut crate::types::TokenLogprob) {
+    /// `stable` bytes as they were.  Returns the entries now placed, in
+    /// order: none while the splitter holds the token undecided, or those
+    /// it held along with this one.
+    fn place(
+        &mut self,
+        response: &str,
+        stable: usize,
+        mut entry: crate::types::TokenLogprob,
+    ) -> Vec<crate::types::TokenLogprob> {
         let start = floor_char_boundary(response, stable.min(response.len()));
         if start < self.bytes {
             // The token rewrote text an earlier token began.
@@ -8373,13 +8395,48 @@ impl LogprobPlacer {
         // After a rewrite the splitter is fed the new text again; the stale
         // text it saw (a replacement character) cannot be part of a tag.
         self.fed = self.fed.min(start);
-        entry.answer = match response.get(self.fed..).filter(|new| !new.is_empty()) {
-            Some(new) => {
-                self.fed = response.len();
-                !self.splitter.push(new).content.is_empty()
-            }
-            None => !self.splitter.in_reasoning(),
+        let undecided = self.splitter.undecided();
+        let Some(new) = response.get(self.fed..).filter(|new| !new.is_empty()) else {
+            entry.answer = !self.splitter.in_reasoning();
+            return self.settle(entry, undecided, false);
         };
+        self.fed = response.len();
+        let out = self.splitter.push(new);
+        entry.answer = !out.content.is_empty();
+        // Answer text beyond what this token wrote is held text let out.
+        let released = out.content.len() > new.len();
+        self.settle(entry, undecided && out.is_empty(), released)
+    }
+
+    /// Queue `entry` while it is `undecided`; otherwise place it after the
+    /// held ones, which are answer when the splitter `released` their text.
+    fn settle(
+        &mut self,
+        entry: crate::types::TokenLogprob,
+        undecided: bool,
+        released: bool,
+    ) -> Vec<crate::types::TokenLogprob> {
+        if undecided {
+            self.pending.push(entry);
+            return Vec::new();
+        }
+        let mut placed = std::mem::take(&mut self.pending);
+        for held in &mut placed {
+            held.answer = released;
+        }
+        placed.push(entry);
+        placed
+    }
+
+    /// Decoding has ended: the held tokens are answer if the splitter's
+    /// remaining text comes out as answer.
+    fn finish(&mut self) -> Vec<crate::types::TokenLogprob> {
+        let answer = !self.splitter.finish().content.is_empty();
+        let mut placed = std::mem::take(&mut self.pending);
+        for held in &mut placed {
+            held.answer = answer;
+        }
+        placed
     }
 }
 
@@ -10467,92 +10524,114 @@ mod tests {
         assert_eq!(response, "éü");
     }
 
+    /// Run `placer` over each step's text (the response after a token, and
+    /// how much of it the token left as it was), then finish; the entries
+    /// come back numbered by step, as placed.
+    fn run_placer(
+        mut placer: LogprobPlacer,
+        steps: &[(String, usize)],
+    ) -> Vec<crate::types::TokenLogprob> {
+        let mut placed = Vec::new();
+        for (i, (response, stable)) in steps.iter().enumerate() {
+            let entry = crate::types::TokenLogprob {
+                token: i as u32,
+                ..Default::default()
+            };
+            placed.extend(placer.place(response, *stable, entry));
+        }
+        placed.extend(placer.finish());
+        placed
+    }
+
+    /// Steps that append each piece in turn.
+    fn appended(pieces: &[&str]) -> Vec<(String, usize)> {
+        let mut response = String::new();
+        pieces
+            .iter()
+            .map(|piece| {
+                let stable = response.len();
+                response.push_str(piece);
+                (response.clone(), stable)
+            })
+            .collect()
+    }
+
     #[test]
     fn logprob_entries_start_where_their_text_does() {
         // "h", then é as two lone bytes: both bytes start at the é, one
         // character in, however the first byte decoded on its own.
         let tk = byte_level_tokenizer();
         let mut w = ByteWindowDecoder::default();
-        let mut placer = LogprobPlacer::new(crate::reasoning::ReasoningFormat::None, false);
         let mut response = String::new();
         let mut all = Vec::new();
-        let mut places = Vec::new();
+        let mut steps = Vec::new();
         for t in [1u32, 3, 4, 1] {
             all.push(t);
             let stable;
             (response, stable) = w.push(&tk, t, response, &all).unwrap();
-            let mut entry = crate::types::TokenLogprob::default();
-            placer.place(&response, stable, &mut entry);
-            places.push((entry.start, entry.offset));
+            steps.push((response.clone(), stable));
         }
         assert_eq!(response, "héh");
-        assert_eq!(places, [(0, 0), (1, 1), (1, 1), (3, 2)]);
+        let placer = LogprobPlacer::new(crate::reasoning::ReasoningFormat::None, false);
+        let places: Vec<_> = run_placer(placer, &steps)
+            .iter()
+            .map(|e| (e.token, e.start, e.offset))
+            .collect();
+        assert_eq!(places, [(0, 0, 0), (1, 1, 1), (2, 1, 1), (3, 3, 2)]);
     }
 
     #[test]
     fn logprob_entries_mark_the_tokens_that_reach_the_answer() {
-        let answers = |pieces: &[&str]| -> Vec<bool> {
-            let format = crate::reasoning::ReasoningFormat::Tags {
-                start: "<think>".into(),
-                end: "</think>".into(),
-            };
-            let mut placer = LogprobPlacer::new(format, false);
-            let mut response = String::new();
-            pieces
-                .iter()
-                .map(|piece| {
-                    let stable = response.len();
-                    response.push_str(piece);
-                    let mut entry = crate::types::TokenLogprob::default();
-                    placer.place(&response, stable, &mut entry);
-                    entry.answer
-                })
-                .collect()
+        let think = || crate::reasoning::ReasoningFormat::Tags {
+            start: "<think>".into(),
+            end: "</think>".into(),
         };
+        let answers = |placer: LogprobPlacer, steps: &[(String, usize)]| -> Vec<bool> {
+            let placed = run_placer(placer, steps);
+            let order: Vec<u32> = placed.iter().map(|e| e.token).collect();
+            assert_eq!(order, (0..steps.len() as u32).collect::<Vec<_>>());
+            placed.iter().map(|e| e.answer).collect()
+        };
+        let tagged = |pieces: &[&str]| answers(LogprobPlacer::new(think(), false), &appended(pieces));
         // Tags in pieces, the dropped whitespace: none of it is answer.
         assert_eq!(
-            answers(&["<thi", "nk>", "secret", "</think>", "\n\n", "Hi"]),
+            tagged(&["<thi", "nk>", "secret", "</think>", "\n\n", "Hi"]),
             [false, false, false, false, false, true]
         );
         // A token that closes the block and begins the answer is answer.
-        assert_eq!(answers(&["<think>", "secret", "</think>Hello", "!"]), [false, false, true, true]);
-        // With no reasoning at all, everything is.
-        assert_eq!(answers(&["Hel", "lo"]), [true, true]);
+        assert_eq!(tagged(&["<think>", "secret", "</think>Hello", "!"]), [false, false, true, true]);
+        // With no reasoning at all, everything is, including text the
+        // splitter held while a block might still have opened.
+        assert_eq!(tagged(&["Hel", "lo"]), [true, true]);
+        assert_eq!(tagged(&[" ", "Hello"]), [true, true]);
+        assert_eq!(tagged(&["<", "3 you"]), [true, true]);
+        assert_eq!(tagged(&[" "]), [true]);
 
         // A character repaired across tokens (a byte-level decode first
         // shows a lone byte as U+FFFD) right before the end tag: the text
         // after the repair still reaches the splitter.
-        let format = crate::reasoning::ReasoningFormat::Tags {
-            start: "<think>".into(),
-            end: "</think>".into(),
-        };
-        let mut placer = LogprobPlacer::new(format, true);
-        let mut repaired = Vec::new();
-        for (response, stable) in [("\u{FFFD}", 0), ("é", 0), ("é<", 2), ("é</think>Hi", 3)] {
-            let mut entry = crate::types::TokenLogprob::default();
-            placer.place(response, stable, &mut entry);
-            repaired.push(entry.answer);
-        }
-        assert_eq!(repaired, [false, false, false, true]);
+        let steps: Vec<(String, usize)> =
+            [("\u{FFFD}", 0), ("é", 0), ("é<", 2), ("é</think>Hi", 3)]
+                .iter()
+                .map(|(r, s)| (r.to_string(), *s))
+                .collect();
+        assert_eq!(
+            answers(LogprobPlacer::new(think(), true), &steps),
+            [false, false, false, true]
+        );
 
         // Harmony: the headers and the analysis channel are not.
-        let mut placer = LogprobPlacer::new(crate::reasoning::ReasoningFormat::Harmony, false);
-        let mut response = String::new();
-        let harmony: Vec<bool> = [
-            "<|channel|>", "analysis", "<|message|>", "secret", "<|end|>", "<|start|>",
-            "assistant", "<|channel|>", "final", "<|message|>", "Hi",
-        ]
-        .iter()
-        .map(|piece| {
-            let stable = response.len();
-            response.push_str(piece);
-            let mut entry = crate::types::TokenLogprob::default();
-            placer.place(&response, stable, &mut entry);
-            entry.answer
-        })
-        .collect();
-        assert_eq!(harmony.iter().filter(|a| **a).count(), 1, "{harmony:?}");
-        assert!(harmony[10], "{harmony:?}");
+        let harmony = answers(
+            LogprobPlacer::new(crate::reasoning::ReasoningFormat::Harmony, false),
+            &appended(&[
+                "<|channel|>", "analysis", "<|message|>", "secret", "<|end|>", "<|start|>",
+                "assistant", "<|channel|>", "final", "<|message|>", "Hi",
+            ]),
+        );
+        assert_eq!(
+            harmony,
+            [false, false, false, false, false, false, false, false, false, false, true]
+        );
     }
 
     #[test]
