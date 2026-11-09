@@ -84,7 +84,7 @@ struct Config {
 /// A `rank_pattern` / `alpha_pattern` entry, compiled.
 struct Pattern<T> {
     key: String,
-    re: regex::Regex,
+    re: fancy_regex::Regex,
     value: T,
 }
 
@@ -95,8 +95,9 @@ fn patterns<T>(
 ) -> Result<Vec<Pattern<T>>> {
     map.iter()
         .map(|(key, v)| {
-            // PEFT: `re.match(rf"(.*\.)?({key})$", name)`.
-            let re = regex::Regex::new(&format!(r"^(?:.*\.)?(?:{key})$"))
+            // PEFT: `re.match(rf"(.*\.)?({key})$", name)`, groups and
+            // all, so a key's backreferences count as Python counts them.
+            let re = fancy_regex::Regex::new(&format!(r"^(.*\.)?({key})$"))
                 .map_err(|e| invalid(format!("{field} key '{key}' is not a valid pattern: {e}")))?;
             let value = value(v).ok_or_else(|| invalid(format!("{field}['{key}'] is not a number")))?;
             Ok(Pattern { key: key.clone(), re, value })
@@ -104,14 +105,26 @@ fn patterns<T>(
         .collect()
 }
 
-/// The value of the first pattern `name` matches (PEFT's
+/// The value of the first pattern a module matches (PEFT's
 /// `get_pattern_key`: an exact key first, then the first matching one).
-fn pick<T: Copy>(patterns: &[Pattern<T>], name: &str) -> Option<T> {
-    patterns
-        .iter()
-        .find(|p| p.key == name)
-        .or_else(|| patterns.iter().find(|p| p.re.is_match(name)))
-        .map(|p| p.value)
+/// `names` are the module's names to try in turn: its name in the base
+/// model, which PEFT matches, then its full key in the weights
+/// (`base_model.model.…`), for a config written against that.
+fn pick<T: Copy>(patterns: &[Pattern<T>], names: &[&str]) -> Result<Option<T>> {
+    for name in names {
+        if let Some(p) = patterns.iter().find(|p| p.key == *name) {
+            return Ok(Some(p.value));
+        }
+        for p in patterns {
+            let hit = p.re.is_match(name).map_err(|e| {
+                invalid(format!("pattern '{}' on '{name}': {e}", p.key))
+            })?;
+            if hit {
+                return Ok(Some(p.value));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// What [`Config::scale`] reads, compiled once.
@@ -168,13 +181,14 @@ impl Config {
 
 impl Scales {
     /// PEFT's scale for the module named `name` (its key in the weights,
-    /// less `base_model.model.` and the `.lora_A.weight` suffix), whose
-    /// pair has rank `rank`.  The rank the config gives the module must be
+    /// less `base_model.model.` and the `.lora_A.weight` suffix; `full`
+    /// keeps the prefix), whose pair has rank `rank`.  The rank the config gives the module must be
     /// the pair's: one that differs means a pattern was not read as PEFT
     /// reads it, and the scale would be wrong.
-    fn scale(&self, name: &str, rank: usize) -> Result<f32> {
-        let r = pick(&self.ranks, name).unwrap_or(self.r);
-        let alpha = pick(&self.alphas, name).unwrap_or(self.alpha);
+    fn scale(&self, name: &str, full: &str, rank: usize) -> Result<f32> {
+        let names = [name, full];
+        let r = pick(&self.ranks, &names)?.unwrap_or(self.r);
+        let alpha = pick(&self.alphas, &names)?.unwrap_or(self.alpha);
         if r != rank {
             return Err(invalid(format!(
                 "module '{name}' has rank {rank}, but the config gives it rank {r}"
@@ -339,6 +353,7 @@ pub fn load(files: &PeftFiles, table: &SlotTable, limits: &LoraLimits) -> Result
         if !seen.insert(key) {
             return Err(invalid(format!("'{module}' targets {base} a second time")));
         }
+        let full = a.strip_suffix(".lora_A.weight").unwrap_or(a).to_string();
         let (a_dims, a) = to_f32(module, &load(a)?)?;
         let (b_dims, mut b) = to_f32(module, &load(b)?)?;
         let (&[rank, a_in], &[b_out, b_rank]) = (&a_dims[..], &b_dims[..]) else {
@@ -367,7 +382,7 @@ pub fn load(files: &PeftFiles, table: &SlotTable, limits: &LoraLimits) -> Result
                 _ => {}
             }
         }
-        let scale = scales.scale(module, rank)?;
+        let scale = scales.scale(module, &full, rank)?;
         b.iter_mut().for_each(|v| *v *= scale);
         let pair = LoraPair::new(a, b, rank, n_in, n_out, table.device()).map_err(invalid)?;
         pairs.push((key, Arc::new(pair)));
@@ -416,24 +431,31 @@ mod tests {
             serde_json::from_str(&format!(r#"{{"r": 8, "lora_alpha": 16{extra}}}"#)).unwrap()
         };
         let scales = |extra: &str| config(extra).scales().unwrap();
-        assert_eq!(scales("").scale("model.layers.0.self_attn.q_proj", 8).unwrap(), 2.0);
+        assert_eq!(scales("").scale("model.layers.0.self_attn.q_proj", "model.layers.0.self_attn.q_proj", 8).unwrap(), 2.0);
         let rs = scales(r#", "use_rslora": true"#);
-        assert!((rs.scale("x", 8).unwrap() - 16.0 / 8f32.sqrt()).abs() < 1e-6);
+        assert!((rs.scale("x", "x", 8).unwrap() - 16.0 / 8f32.sqrt()).abs() < 1e-6);
         let pat = scales(r#", "rank_pattern": {"q_proj": 4}, "alpha_pattern": {"layers.0.self_attn.q_proj": 2}"#);
-        assert_eq!(pat.scale("model.layers.0.self_attn.q_proj", 4).unwrap(), 0.5);
-        assert_eq!(pat.scale("model.layers.1.self_attn.q_proj", 4).unwrap(), 4.0);
-        assert_eq!(pat.scale("model.layers.1.self_attn.v_proj", 8).unwrap(), 2.0);
+        assert_eq!(pat.scale("model.layers.0.self_attn.q_proj", "model.layers.0.self_attn.q_proj", 4).unwrap(), 0.5);
+        assert_eq!(pat.scale("model.layers.1.self_attn.q_proj", "model.layers.1.self_attn.q_proj", 4).unwrap(), 4.0);
+        assert_eq!(pat.scale("model.layers.1.self_attn.v_proj", "model.layers.1.self_attn.v_proj", 8).unwrap(), 2.0);
         // Keys are regular expressions, matched as PEFT matches them: the
         // whole name, or a dotted suffix of it; the first match wins.
         let re = scales(r#", "rank_pattern": {"q_proj$": 4, "layers\\.[01]\\..*v_proj": 2, "v_proj": 16}"#);
-        assert_eq!(re.scale("model.layers.0.self_attn.q_proj", 4).unwrap(), 4.0);
-        assert_eq!(re.scale("model.layers.1.self_attn.v_proj", 2).unwrap(), 8.0);
-        assert_eq!(re.scale("model.layers.2.self_attn.v_proj", 16).unwrap(), 1.0);
+        assert_eq!(re.scale("model.layers.0.self_attn.q_proj", "model.layers.0.self_attn.q_proj", 4).unwrap(), 4.0);
+        assert_eq!(re.scale("model.layers.1.self_attn.v_proj", "model.layers.1.self_attn.v_proj", 2).unwrap(), 8.0);
+        assert_eq!(re.scale("model.layers.2.self_attn.v_proj", "model.layers.2.self_attn.v_proj", 16).unwrap(), 1.0);
         // `proj` alone matches no dotted suffix.
-        assert_eq!(scales(r#", "rank_pattern": {"proj": 4}"#).scale("model.layers.0.mlp.up_proj", 8).unwrap(), 2.0);
+        assert_eq!(scales(r#", "rank_pattern": {"proj": 4}"#).scale("model.layers.0.mlp.up_proj", "model.layers.0.mlp.up_proj", 8).unwrap(), 2.0);
         // A rank the config does not give the pair is refused, not mis-scaled.
-        assert!(pat.scale("model.layers.0.self_attn.q_proj", 8).is_err());
+        assert!(pat.scale("model.layers.0.self_attn.q_proj", "model.layers.0.self_attn.q_proj", 8).is_err());
         assert!(config(r#", "rank_pattern": {"(": 4}"#).scales().is_err());
+        // Python's lookaround, and a key written against the full weight key.
+        let look = scales(r#", "rank_pattern": {"q_proj(?<!layers\\.1\\.self_attn\\.q_proj)": 4}"#);
+        assert_eq!(look.scale("model.layers.0.self_attn.q_proj", "model.layers.0.self_attn.q_proj", 4).unwrap(), 4.0);
+        assert_eq!(look.scale("model.layers.1.self_attn.q_proj", "model.layers.1.self_attn.q_proj", 8).unwrap(), 2.0);
+        let full = scales(r#", "alpha_pattern": {"base_model.model.model.layers.0.self_attn.q_proj": 4}"#);
+        let (name, key) = ("model.layers.0.self_attn.q_proj", "base_model.model.model.layers.0.self_attn.q_proj");
+        assert_eq!(full.scale(name, key, 8).unwrap(), 0.5);
         assert!(config(r#", "alora_invocation_tokens": [101, 102]"#).check().is_err());
         assert!(config(r#", "alora_invocation_tokens": null"#).check().is_ok());
         assert!(config(r#", "use_dora": true"#).check().is_err());
