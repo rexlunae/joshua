@@ -3718,7 +3718,7 @@ impl Engine {
                 && session.supports_snapshot()
                 && self.root_wanted(&tokens[..r], scope)
                 // A root the cache cannot hold is not worth a second read.
-                && self.snapshot_fits(&session, r, tokens.len())
+                && self.root_may_fit(&session, r, tokens.len())
         });
         match scored {
             // All but the last token, which generation feeds for its logits.
@@ -6528,6 +6528,18 @@ impl Engine {
     fn ram_allows_copy(bytes: u64) -> bool {
         crate::placement::available_ram_bytes()
             .is_none_or(|free| free >= LOW_MEM_FLOOR * 3 + bytes)
+    }
+
+    /// Whether a recurrent session's state after `keep` of the `len` tokens
+    /// it holds could fit the prefix cache, judged before reading the prompt
+    /// again to get it.  The state at `keep` is unknown until then: its
+    /// attention part grows with the tokens, its recurrent part does not.
+    /// The estimate scales the whole state by `keep / len`, a lower bound,
+    /// so a root that fits is never passed over; [`Engine::store_root`]
+    /// checks the real size.
+    fn root_may_fit(&self, session: &GenSession, keep: usize, len: usize) -> bool {
+        let bytes = (session.state_bytes() as u128 * keep as u128 / len.max(1) as u128) as u64;
+        self.prefix_cache().fits(bytes) && Self::ram_allows_copy(bytes)
     }
 
     /// Whether a snapshot of `session` after `keep` of its `len` tokens fits
