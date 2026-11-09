@@ -2036,6 +2036,24 @@ async fn logprobs_are_reported_in_each_api_shape() {
     }
     assert_eq!(&stream_tokens, lp["tokens"].as_array().unwrap(), "{body}");
     assert_eq!(&stream_offsets, lp["text_offset"].as_array().unwrap(), "{body}");
+    // A stop sequence takes its tokens' entries with it, streamed or not
+    // (the fixture writes "cccc", so "cc" ends it at once, leaving nothing).
+    let mut stopped = completion.clone();
+    stopped["stop"] = serde_json::json!("cc");
+    let (status, body) = call("/v1/completions", stopped.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["choices"][0]["finish_reason"], "stop", "{body}");
+    assert_eq!(v["choices"][0]["text"], "", "{body}");
+    assert_eq!(v["choices"][0]["logprobs"]["tokens"], serde_json::json!([]), "{body}");
+    stopped["stream"] = serde_json::json!(true);
+    let (status, body) = call("/v1/completions", stopped).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let streamed: usize = events(&body)
+        .iter()
+        .filter_map(|e| e["choices"][0]["logprobs"]["tokens"].as_array().map(Vec::len))
+        .sum();
+    assert_eq!(streamed, 0, "{body}");
 
     // llama-server: `completion_probabilities` with `n_probs` alternatives.
     let llama = serde_json::json!({

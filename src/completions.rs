@@ -380,11 +380,8 @@ pub(crate) fn stream_all(
     let cancel = CancelOnDrop::new();
     let flag = cancel.flag();
     metrics.record_stream();
-    let sink = options.logprobs.map(|_| LogprobSink::default());
-    options.logprob_sink = sink.clone();
     tokio::task::spawn_blocking(move || {
         let flag: &AtomicBool = &flag;
-        let take = || sink.as_ref().map(LogprobSink::take).unwrap_or_default();
         let send = |value: Option<Value>| {
             if let Some(value) = value {
                 let _ = tx.send(value.to_string());
@@ -396,6 +393,10 @@ pub(crate) fn stream_all(
             }
         };
         for (index, job) in jobs.iter().enumerate() {
+            // Each prompt's tokens are placed in its own text.
+            let sink = options.logprobs.map(|_| LogprobSink::default());
+            options.logprob_sink = sink.clone();
+            let take = || sink.as_ref().map(LogprobSink::take).unwrap_or_default();
             let result =
                 engine.complete_prompt_streaming(&job.prompt, &options, flag, &mut |text| {
                     send(frame(Progress::Text(index, text, &take())))
@@ -483,27 +484,24 @@ pub(crate) async fn completions(
     let created = unix_time();
 
     if req.stream == Some(true) {
-        // Each chunk's tokens, their offsets running on through the choice.
-        let mut offsets = vec![0usize; jobs.len()];
-        let mut render = {
+        // Each chunk's tokens, offset into the whole choice's text.
+        let render = {
             let engine = Arc::clone(&engine);
-            move |index: usize, entries: &[TokenLogprob]| -> Value {
+            move |entries: &[TokenLogprob]| -> Value {
                 if logprobs.is_none() {
                     return Value::Null;
                 }
-                let value = crate::logprobs::completion(&engine, entries, offsets[index]);
-                offsets[index] += crate::logprobs::text_len(&engine, entries);
-                value
+                crate::logprobs::completion(&engine, entries)
             }
         };
-        let mut chunk = move |index: usize,
-                              text: &str,
-                              entries: &[TokenLogprob],
-                              finish: Option<&str>| {
+        let chunk = move |index: usize,
+                          text: &str,
+                          entries: &[TokenLogprob],
+                          finish: Option<&str>| {
             json!({
                 "id": id, "object": "text_completion", "created": created, "model": model,
                 "choices": [{
-                    "index": index, "text": text, "logprobs": render(index, entries),
+                    "index": index, "text": text, "logprobs": render(entries),
                     "finish_reason": finish,
                 }],
             })
@@ -568,7 +566,7 @@ pub(crate) async fn completions(
                 completion.text.clone()
             };
             let logprobs = match logprobs {
-                Some(_) => crate::logprobs::completion(&engine, &completion.logprobs, 0),
+                Some(_) => crate::logprobs::completion(&engine, &completion.logprobs),
                 None => Value::Null,
             };
             json!({

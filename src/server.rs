@@ -2084,7 +2084,7 @@ async fn chat_completions(
             },
             finish_reason: finish_reason.to_string(),
             logprobs: wants_logprobs
-                .then(|| crate::logprobs::chat(&engine, &completion.logprobs)),
+                .then(|| crate::logprobs::chat(&engine, &completion.logprobs, reasoning_output.splits(false))),
         }],
         completion.usage.clone(),
     );
@@ -2284,8 +2284,10 @@ struct ChatStreamEmitter<'e> {
     tx: tokio::sync::mpsc::UnboundedSender<String>,
     role_sent: bool,
     /// Where the decode loop leaves the tokens' log-probabilities, when the
-    /// request asked; each chunk carries those of the text it sends.
-    logprobs: Option<(&'e Engine, crate::types::LogprobSink)>,
+    /// request asked, and whether the reasoning is split off (its tokens are
+    /// then left out).  Each answer chunk carries those of the text
+    /// released with it; the last chunk carries the rest.
+    logprobs: Option<(&'e Engine, crate::types::LogprobSink, bool)>,
 }
 
 impl<'e> ChatStreamEmitter<'e> {
@@ -2312,7 +2314,16 @@ impl<'e> ChatStreamEmitter<'e> {
             content: Some(text.to_string()),
             ..Default::default()
         };
-        self.send(delta, None, None, None);
+        let logprobs = self.take_logprobs();
+        self.send(delta, logprobs, None, None, None);
+    }
+
+    /// The log-probabilities released so far, as a chunk carries them.
+    fn take_logprobs(&self) -> Option<serde_json::Value> {
+        let (engine, sink, split) = self.logprobs.as_ref()?;
+        let entries = sink.take();
+        let answer = entries.iter().any(|e| !(*split && e.reasoning));
+        answer.then(|| crate::logprobs::chat(engine, &entries, *split))
     }
 
     /// Reasoning text, under both llama.cpp's and vLLM's field names.
@@ -2326,7 +2337,7 @@ impl<'e> ChatStreamEmitter<'e> {
             reasoning: Some(text.to_string()),
             ..Default::default()
         };
-        self.send(delta, None, None, None);
+        self.send(delta, None, None, None, None);
     }
 
     /// A call's first chunk carries its id, type and name (OpenAI's and
@@ -2342,7 +2353,7 @@ impl<'e> ChatStreamEmitter<'e> {
             }])),
             ..Default::default()
         };
-        self.send(delta, None, None, None);
+        self.send(delta, None, None, None, None);
     }
 
     /// More of call `index`'s arguments.
@@ -2354,7 +2365,7 @@ impl<'e> ChatStreamEmitter<'e> {
             }])),
             ..Default::default()
         };
-        self.send(delta, None, None, None);
+        self.send(delta, None, None, None, None);
     }
 
     /// Send one piece of the shared post-processing's output; reasoning
@@ -2370,8 +2381,10 @@ impl<'e> ChatStreamEmitter<'e> {
     }
 
     fn finish(&mut self, reason: &str, usage: &UsageInfo, timings: &crate::types::Timings) {
+        let logprobs = self.take_logprobs();
         self.send(
             DeltaContent::default(),
+            logprobs,
             Some(reason.to_string()),
             Some(usage),
             Some(timings),
@@ -2402,6 +2415,7 @@ impl<'e> ChatStreamEmitter<'e> {
     fn send(
         &self,
         delta: DeltaContent,
+        logprobs: Option<serde_json::Value>,
         finish_reason: Option<String>,
         usage: Option<&UsageInfo>,
         timings: Option<&crate::types::Timings>,
@@ -2409,11 +2423,8 @@ impl<'e> ChatStreamEmitter<'e> {
         let chunk =
             ChatCompletionChunk::new(self.id.clone(), self.model.clone(), delta, finish_reason);
         let mut value = serde_json::to_value(&chunk).unwrap_or_default();
-        if let Some((engine, sink)) = &self.logprobs {
-            let entries = sink.take();
-            if !entries.is_empty() {
-                value["choices"][0]["logprobs"] = crate::logprobs::chat(engine, &entries);
-            }
+        if let Some(logprobs) = logprobs {
+            value["choices"][0]["logprobs"] = logprobs;
         }
         if let Some(usage) = usage {
             value["usage"] = serde_json::to_value(usage).unwrap_or_default();
@@ -2448,7 +2459,11 @@ fn stream_chat_completion(
     metrics: &ServerMetrics,
 ) {
     let mut emitter = ChatStreamEmitter::new(id.to_string(), model.to_string(), tx);
-    emitter.logprobs = options.logprob_sink.clone().map(|sink| (engine, sink));
+    let split = output.reasoning.splits(true);
+    emitter.logprobs = options
+        .logprob_sink
+        .clone()
+        .map(|sink| (engine, sink, split));
     let show_reasoning = output.reasoning != ReasoningOutput::Hidden;
     if let Some(prefix) = &output.echo {
         emitter.text(prefix);

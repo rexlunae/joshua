@@ -1923,6 +1923,10 @@ struct DecodeText<'a> {
     /// The window's length (0 turns the penalties off).
     window: usize,
     n_decoded: u32,
+    /// How much of `response` (bytes) the latest token left as it was: the
+    /// response before it, less any tail the token rewrote (a byte-level
+    /// decode can complete a character across tokens).
+    stable: usize,
 }
 
 impl<'a> DecodeText<'a> {
@@ -1937,6 +1941,7 @@ impl<'a> DecodeText<'a> {
             recent_tokens: seed[seed.len().saturating_sub(window)..].to_vec(),
             window,
             n_decoded: 0,
+            stable: 0,
         }
     }
 }
@@ -2012,10 +2017,12 @@ impl<'a> ReasoningTracker<'a> {
 struct StreamGate {
     sent: usize,
     holdback: usize,
+    /// Log-probabilities released along with their tokens' text.
+    logprobs: Option<crate::types::LogprobSink>,
 }
 
 impl StreamGate {
-    fn new(stop_sequences: &[String]) -> Self {
+    fn new(stop_sequences: &[String], logprobs: Option<crate::types::LogprobSink>) -> Self {
         Self {
             sent: 0,
             holdback: stop_sequences
@@ -2023,6 +2030,15 @@ impl StreamGate {
                 .map(String::len)
                 .max()
                 .unwrap_or(0),
+            logprobs,
+        }
+    }
+
+    /// Release every log-probability entry, text or not: decoding ended
+    /// without a stop sequence trimming anything.
+    fn release_all(&self) {
+        if let Some(sink) = &self.logprobs {
+            sink.release(usize::MAX);
         }
     }
 
@@ -2055,6 +2071,10 @@ impl StreamGate {
         on_text: Option<&mut (dyn FnMut(&str) + '_)>,
     ) {
         let end = end.min(response.len());
+        // Before the text goes out, so its caller finds the entries there.
+        if let Some(sink) = &self.logprobs {
+            sink.release(end);
+        }
         if end <= self.sent {
             // A stop sequence can trim the response below text already sent
             // only if it is longer than the holdback, which `new` prevents.
@@ -2154,14 +2174,15 @@ struct ByteWindowDecoder {
 impl ByteWindowDecoder {
     const WINDOW: usize = 8;
 
-    /// Feed one token, returning the updated output text (`response`).
+    /// Feed one token, returning the updated output text (`response`) and
+    /// how many of its leading bytes the token left unchanged.
     fn push(
         &mut self,
         tokenizer: &Tokenizer,
         token: u32,
         response: String,
         all_ids: &[u32],
-    ) -> Result<String> {
+    ) -> Result<(String, usize)> {
         let decode = |ids: &[u32]| -> Result<String> {
             tokenizer
                 .decode(ids, false)
@@ -2170,14 +2191,22 @@ impl ByteWindowDecoder {
 
         self.tail.push(token);
         let new_text = decode(&self.tail)?;
-        let response = if new_text.starts_with(&self.tail_text) {
+        let (response, stable) = if new_text.starts_with(&self.tail_text) {
             // Stable extension: append just the new suffix.
             let mut response = response;
+            let stable = response.len();
             response.push_str(&new_text[self.tail_text.len()..]);
-            response
+            (response, stable)
         } else {
             // A codepoint completed across the boundary: take the oracle.
-            decode(all_ids)?
+            let new = decode(all_ids)?;
+            let common = response
+                .bytes()
+                .zip(new.bytes())
+                .take_while(|(a, b)| a == b)
+                .count();
+            let stable = floor_char_boundary(&new, common);
+            (new, stable)
         };
         self.tail_text = new_text;
 
@@ -2192,7 +2221,7 @@ impl ByteWindowDecoder {
             self.tail.remove(0);
             self.tail_text = shrunk;
         }
-        Ok(response)
+        Ok((response, stable))
     }
 }
 
@@ -5155,7 +5184,7 @@ impl Engine {
         let n_ctx = self.effective_n_ctx(options);
         let window = penalty_window(options.repeat_last_n, n_ctx);
         let mut text = DecodeText::new(penalty_seed, &self.tokenizer, window);
-        let mut stream = StreamGate::new(&options.stop_sequences);
+        let mut stream = StreamGate::new(&options.stop_sequences, options.logprob_sink.clone());
         // A fixed seed makes every draw a pure function of (seed, position,
         // stream); without one, pick a request seed once and keep the stream
         // reproducible for the rest of this generation.
@@ -5206,6 +5235,9 @@ impl Engine {
         // Asked-for log-probabilities; their requests decode plainly, so
         // every token comes from `logits_vec` below.
         let mut logprobs = Vec::new();
+        let mut placer = options
+            .logprobs
+            .map(|_| LogprobPlacer::new(self.reasoning_format.clone(), reasoning_open));
         let mut n_cur = start_pos;
         let decode_start = Instant::now();
         // Which configured stop sequence ended generation, if any.
@@ -5353,16 +5385,17 @@ impl Engine {
                     JoshuaError::Inference(format!("constrained decoding: {e}"))
                 })?;
             }
+            let stopped = self.emit_token(&mut text, next_token, options)?;
             // Recorded before the token's text is released, so a streaming
             // caller finds it with that text.
-            if let Some(top) = options.logprobs {
-                let entry = token_logprob(&logits_vec, next_token, top);
+            if let (Some(top), Some(placer)) = (options.logprobs, placer.as_mut()) {
+                let mut entry = token_logprob(&logits_vec, next_token, top);
+                placer.place(&text.response, text.stable, &mut entry);
                 if let Some(sink) = &options.logprob_sink {
                     sink.push(entry.clone());
                 }
                 logprobs.push(entry);
             }
-            let stopped = self.emit_token(&mut text, next_token, options)?;
             sampler.accept(next_token);
             if let Some(r) = reasoning.as_mut() {
                 r.observe(&text.decoded_ids);
@@ -5557,6 +5590,12 @@ impl Engine {
             pool.release(d.session);
         }
 
+        if stop_type == StopType::Word {
+            // The tokens of a stop sequence trimmed from the text go with it.
+            logprobs.retain(|e: &crate::types::TokenLogprob| e.start < text.response.len());
+        } else {
+            stream.release_all();
+        }
         stream.finish(&text.response, on_text.as_deref_mut());
 
         let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
@@ -5794,6 +5833,7 @@ impl Engine {
         options: &GenerationOptions,
     ) -> Result<Option<String>> {
         text.decoded_ids.push(token);
+        text.stable = text.response.len();
         if self.byte_level_decode {
             // Byte-level BPE splits multi-byte UTF-8 across token
             // boundaries — a single token can be a lone byte (e.g.
@@ -5803,7 +5843,7 @@ impl Engine {
             // without re-decoding the whole output every step (the old
             // whole-buffer decode made generation O(n²) in length).
             let response = std::mem::take(&mut text.response);
-            text.response =
+            (text.response, text.stable) =
                 text.byte_window
                     .push(&self.tokenizer, token, response, &text.decoded_ids)?;
         } else if self.tokenizer.get_decoder().is_some() {
@@ -8286,6 +8326,53 @@ fn token_logprob(logits: &[f32], token: u32, top: u32) -> crate::types::TokenLog
         token,
         logprob: logprob(token as usize),
         top: best.into_iter().map(|(id, v)| (id, v - lse)).collect(),
+        ..Default::default()
+    }
+}
+
+/// Places each generated token's [`crate::types::TokenLogprob`] in the
+/// text: where its text starts, in bytes and characters, and whether it is
+/// reasoning, by following the text through a reasoning splitter of its
+/// own (a token is reasoning when the block is open before or after it, so
+/// the tags count too).
+struct LogprobPlacer {
+    /// `chars` characters make up the text's first `bytes` bytes.
+    bytes: usize,
+    chars: usize,
+    splitter: crate::reasoning::ReasoningSplitter,
+    /// How much of the text the splitter has been given.
+    fed: usize,
+}
+
+impl LogprobPlacer {
+    fn new(format: crate::reasoning::ReasoningFormat, reasoning_open: bool) -> Self {
+        Self {
+            bytes: 0,
+            chars: 0,
+            splitter: crate::reasoning::ReasoningSplitter::new(format, reasoning_open),
+            fed: 0,
+        }
+    }
+
+    /// Place the token just appended to `response`, which left its first
+    /// `stable` bytes as they were.
+    fn place(&mut self, response: &str, stable: usize, entry: &mut crate::types::TokenLogprob) {
+        let start = floor_char_boundary(response, stable.min(response.len()));
+        if start < self.bytes {
+            // The token rewrote text an earlier token began.
+            self.bytes = 0;
+            self.chars = 0;
+        }
+        self.chars += response[self.bytes..start].chars().count();
+        self.bytes = start;
+        entry.start = start;
+        entry.offset = self.chars;
+        let before = self.splitter.in_reasoning();
+        if let Some(new) = response.get(self.fed..).filter(|new| !new.is_empty()) {
+            self.splitter.push(new);
+            self.fed = response.len();
+        }
+        entry.reasoning = before || self.splitter.in_reasoning();
     }
 }
 
@@ -10361,16 +10448,57 @@ mod tests {
         // é arrives as two lone bytes (0xC3, 0xA9).
         for t in [3u32, 4] {
             all.push(t);
-            response = w.push(&tk, t, response, &all).unwrap();
+            response = w.push(&tk, t, response, &all).unwrap().0;
         }
         assert_eq!(response, "é", "split codepoint must complete: {response:?}");
 
         // ü arrives right behind it, again as two lone bytes.
         for t in [3u32, 5] {
             all.push(t);
-            response = w.push(&tk, t, response, &all).unwrap();
+            response = w.push(&tk, t, response, &all).unwrap().0;
         }
         assert_eq!(response, "éü");
+    }
+
+    #[test]
+    fn logprob_entries_start_where_their_text_does() {
+        // "h", then é as two lone bytes: both bytes start at the é, one
+        // character in, however the first byte decoded on its own.
+        let tk = byte_level_tokenizer();
+        let mut w = ByteWindowDecoder::default();
+        let mut placer = LogprobPlacer::new(crate::reasoning::ReasoningFormat::None, false);
+        let mut response = String::new();
+        let mut all = Vec::new();
+        let mut places = Vec::new();
+        for t in [1u32, 3, 4, 1] {
+            all.push(t);
+            let stable;
+            (response, stable) = w.push(&tk, t, response, &all).unwrap();
+            let mut entry = crate::types::TokenLogprob::default();
+            placer.place(&response, stable, &mut entry);
+            places.push((entry.start, entry.offset));
+        }
+        assert_eq!(response, "héh");
+        assert_eq!(places, [(0, 0), (1, 1), (1, 1), (3, 2)]);
+    }
+
+    #[test]
+    fn logprob_entries_mark_the_reasoning_block() {
+        let format = crate::reasoning::ReasoningFormat::Tags {
+            start: "<think>".into(),
+            end: "</think>".into(),
+        };
+        let mut placer = LogprobPlacer::new(format, false);
+        let mut response = String::new();
+        let mut reasoning = Vec::new();
+        for piece in ["<think>", "secret", "</think>", "\n\n", "Hi"] {
+            let stable = response.len();
+            response.push_str(piece);
+            let mut entry = crate::types::TokenLogprob::default();
+            placer.place(&response, stable, &mut entry);
+            reasoning.push(entry.reasoning);
+        }
+        assert_eq!(reasoning, [true, true, true, false, false]);
     }
 
     #[test]
@@ -10385,14 +10513,14 @@ mod tests {
         // up immediately as duplicated characters.
         for _ in 0..12 {
             all.push(1u32); // "h"
-            response = w.push(&tk, 1, response, &all).unwrap();
+            response = w.push(&tk, 1, response, &all).unwrap().0;
         }
         assert_eq!(response, "hhhhhhhhhhhh");
 
         // And a completing multi-byte pair right behind the run.
         for t in [3u32, 4] {
             all.push(t);
-            response = w.push(&tk, t, response, &all).unwrap();
+            response = w.push(&tk, t, response, &all).unwrap().0;
         }
         assert_eq!(response, "hhhhhhhhhhhhé");
     }
@@ -10424,7 +10552,7 @@ mod tests {
             };
             let _ = step;
             all.push(t);
-            response = w.push(&tk, t, response, &all).unwrap();
+            response = w.push(&tk, t, response, &all).unwrap().0;
             let oracle = tk.decode(all.as_slice(), false).unwrap();
             assert_eq!(
                 response,
@@ -11108,7 +11236,7 @@ mod tests {
         let seen = std::cell::RefCell::new(String::new());
         let mut sink = |text: &str| seen.borrow_mut().push_str(text);
         let stops = vec!["END".to_string()];
-        let mut gate = StreamGate::new(&stops);
+        let mut gate = StreamGate::new(&stops, None);
 
         // "EN" is a prefix of the stop sequence, so it stays withheld.
         gate.push("hello EN", false, Some(&mut sink));
@@ -11124,7 +11252,7 @@ mod tests {
     fn stream_gate_flushes_without_stop_sequences() {
         let seen = std::cell::RefCell::new(String::new());
         let mut sink = |text: &str| seen.borrow_mut().push_str(text);
-        let mut gate = StreamGate::new(&[]);
+        let mut gate = StreamGate::new(&[], None);
         gate.push("hel", false, Some(&mut sink));
         gate.push("lo", false, Some(&mut sink));
         gate.finish("hello", Some(&mut sink));

@@ -177,7 +177,7 @@ impl ChatMessage {
 pub const MAX_TOP_LOGPROBS: u32 = 20;
 
 /// One generated token's log-probability, with the likeliest alternatives.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct TokenLogprob {
     /// The token generated.
     pub token: u32,
@@ -186,22 +186,60 @@ pub struct TokenLogprob {
     /// The likeliest tokens at that step, most likely first, as many as
     /// [`GenerationOptions::logprobs`] asked for.
     pub top: Vec<(u32, f32)>,
+    /// Where the token's text starts in the generated text, in bytes.  A
+    /// token that only completes a character another token began (a byte
+    /// fragment) starts where that character does.
+    pub start: usize,
+    /// The same place in characters (the legacy completions API's
+    /// `text_offset`).
+    pub offset: usize,
+    /// Whether the token is part of a reasoning block (including its tags),
+    /// which a chat response splits off the answer.
+    pub reasoning: bool,
 }
 
 /// A shared buffer the decode loop pushes [`TokenLogprob`]s into, for a
-/// streaming caller to take with the text they belong to.
+/// streaming caller to take with the text they belong to.  The decode loop
+/// releases entries as it releases their text, so an entry whose text is
+/// still held back (it may begin a stop sequence) is not taken early, and
+/// one whose text a stop sequence removes is never taken.
 #[derive(Clone, Default)]
-pub struct LogprobSink(std::sync::Arc<std::sync::Mutex<Vec<TokenLogprob>>>);
+pub struct LogprobSink(std::sync::Arc<std::sync::Mutex<LogprobQueue>>);
+
+#[derive(Default)]
+struct LogprobQueue {
+    entries: std::collections::VecDeque<TokenLogprob>,
+    /// Entries starting before this byte of the text may be taken.
+    released: usize,
+}
 
 impl LogprobSink {
-    /// Add one token's figures.
-    pub fn push(&self, entry: TokenLogprob) {
-        self.0.lock().unwrap_or_else(|p| p.into_inner()).push(entry);
+    fn queue(&self) -> std::sync::MutexGuard<'_, LogprobQueue> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner())
     }
 
-    /// Everything pushed since the last take.
+    /// Add one token's figures.
+    pub fn push(&self, entry: TokenLogprob) {
+        self.queue().entries.push_back(entry);
+    }
+
+    /// Let entries whose text starts before byte `end` be taken (`usize::MAX`
+    /// releases all of them).
+    pub fn release(&self, end: usize) {
+        let mut queue = self.queue();
+        queue.released = queue.released.max(end);
+    }
+
+    /// The released entries not taken yet, in order.
     pub fn take(&self) -> Vec<TokenLogprob> {
-        std::mem::take(&mut *self.0.lock().unwrap_or_else(|p| p.into_inner()))
+        let mut queue = self.queue();
+        let released = queue.released;
+        let n = queue
+            .entries
+            .iter()
+            .take_while(|e| e.start < released)
+            .count();
+        queue.entries.drain(..n).collect()
     }
 }
 

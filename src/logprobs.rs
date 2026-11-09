@@ -40,14 +40,18 @@ pub(crate) fn count(field: &str, n: i64) -> Result<u32, String> {
 }
 
 /// OpenAI chat's `logprobs` object: `{"content": [...]}`, one entry per
-/// token with its `token`, `logprob`, `bytes` and `top_logprobs`.
-pub(crate) fn chat(engine: &Engine, entries: &[TokenLogprob]) -> Value {
+/// answer token with its `token`, `logprob`, `bytes` and `top_logprobs`.
+/// When the response splits the reasoning off (`split_reasoning`), its
+/// tokens are left out as they are of `content`, so hidden reasoning stays
+/// hidden.
+pub(crate) fn chat(engine: &Engine, entries: &[TokenLogprob], split_reasoning: bool) -> Value {
     let item = |id: u32, logprob: f32| {
         let (token, bytes) = piece(engine, id);
         json!({"token": token, "logprob": finite(logprob), "bytes": bytes})
     };
     let content: Vec<Value> = entries
         .iter()
+        .filter(|entry| !(split_reasoning && entry.reasoning))
         .map(|entry| {
             let mut value = item(entry.token, entry.logprob);
             value["top_logprobs"] = entry.top.iter().map(|&(id, lp)| item(id, lp)).collect();
@@ -60,14 +64,13 @@ pub(crate) fn chat(engine: &Engine, entries: &[TokenLogprob]) -> Value {
 /// The legacy completions API's `logprobs` object: parallel `tokens`,
 /// `token_logprobs`, `top_logprobs` (each a token-to-logprob map holding
 /// the alternatives and the token itself, as vLLM's does) and
-/// `text_offset` arrays.  Offsets count characters from `offset`, where
-/// this run of tokens starts in the choice's text.
-pub(crate) fn completion(engine: &Engine, entries: &[TokenLogprob], offset: usize) -> Value {
+/// `text_offset` arrays.  Offsets count characters into the choice's text,
+/// from where each token's text starts there.
+pub(crate) fn completion(engine: &Engine, entries: &[TokenLogprob]) -> Value {
     let mut tokens = Vec::with_capacity(entries.len());
     let mut token_logprobs = Vec::with_capacity(entries.len());
     let mut top_logprobs = Vec::with_capacity(entries.len());
     let mut text_offset = Vec::with_capacity(entries.len());
-    let mut at = offset;
     for entry in entries {
         let (token, _) = piece(engine, entry.token);
         let mut top = Map::new();
@@ -75,8 +78,7 @@ pub(crate) fn completion(engine: &Engine, entries: &[TokenLogprob], offset: usiz
             top.insert(piece(engine, id).0, json!(finite(lp)));
         }
         top.insert(token.clone(), json!(finite(entry.logprob)));
-        text_offset.push(at);
-        at += token.chars().count();
+        text_offset.push(entry.offset);
         tokens.push(token);
         token_logprobs.push(finite(entry.logprob));
         top_logprobs.push(Value::Object(top));
@@ -87,14 +89,6 @@ pub(crate) fn completion(engine: &Engine, entries: &[TokenLogprob], offset: usiz
         "top_logprobs": top_logprobs,
         "text_offset": text_offset,
     })
-}
-
-/// The characters [`completion`] advances its offsets by for `entries`.
-pub(crate) fn text_len(engine: &Engine, entries: &[TokenLogprob]) -> usize {
-    entries
-        .iter()
-        .map(|entry| piece(engine, entry.token).0.chars().count())
-        .sum()
 }
 
 /// llama-server's `completion_probabilities`: one entry per token with its
