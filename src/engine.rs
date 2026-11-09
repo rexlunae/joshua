@@ -3717,6 +3717,8 @@ impl Engine {
                 && !session.supports_truncate()
                 && session.supports_snapshot()
                 && self.root_wanted(&tokens[..r], scope)
+                // A root the cache cannot hold is not worth a second read.
+                && self.snapshot_fits(&session, r, tokens.len())
         });
         match scored {
             // All but the last token, which generation feeds for its logits.
