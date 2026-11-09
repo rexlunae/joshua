@@ -13,10 +13,11 @@
 //! per module under `rank_pattern` / `alpha_pattern`), is folded into each
 //! `B`, and the adapter runs with alpha 0, so a request's scale multiplies
 //! PEFT's own as it does in PEFT.  Adapters PEFT runs with more than the
-//! low-rank pairs (DoRA, trained biases, `modules_to_save`, embedding or
-//! output-head pairs, `fan_in_fan_out` Conv1D weights) are refused.
+//! low-rank pairs (DoRA, activated LoRA, trained biases, `modules_to_save`,
+//! embedding or output-head pairs, `fan_in_fan_out` Conv1D weights) are
+//! refused.  The weights are mapped, not read, and decoded a pair at a time.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -68,10 +69,58 @@ struct Config {
     fan_in_fan_out: bool,
     #[serde(default)]
     modules_to_save: Option<Vec<String>>,
+    /// Per-module ranks and alphas, keyed by regular expressions PEFT
+    /// matches against module names, in the config's order (the first
+    /// match wins, as in PEFT).
     #[serde(default)]
-    rank_pattern: HashMap<String, usize>,
+    rank_pattern: serde_json::Map<String, serde_json::Value>,
     #[serde(default)]
-    alpha_pattern: HashMap<String, f32>,
+    alpha_pattern: serde_json::Map<String, serde_json::Value>,
+    /// Activated LoRA: the adapter applies only after these tokens.
+    #[serde(default)]
+    alora_invocation_tokens: Option<Vec<u32>>,
+}
+
+/// A `rank_pattern` / `alpha_pattern` entry, compiled.
+struct Pattern<T> {
+    key: String,
+    re: regex::Regex,
+    value: T,
+}
+
+fn patterns<T>(
+    field: &str,
+    map: &serde_json::Map<String, serde_json::Value>,
+    value: impl Fn(&serde_json::Value) -> Option<T>,
+) -> Result<Vec<Pattern<T>>> {
+    map.iter()
+        .map(|(key, v)| {
+            // PEFT: `re.match(rf"(.*\.)?({key})$", name)`.
+            let re = regex::Regex::new(&format!(r"^(?:.*\.)?(?:{key})$"))
+                .map_err(|e| invalid(format!("{field} key '{key}' is not a valid pattern: {e}")))?;
+            let value = value(v).ok_or_else(|| invalid(format!("{field}['{key}'] is not a number")))?;
+            Ok(Pattern { key: key.clone(), re, value })
+        })
+        .collect()
+}
+
+/// The value of the first pattern `name` matches (PEFT's
+/// `get_pattern_key`: an exact key first, then the first matching one).
+fn pick<T: Copy>(patterns: &[Pattern<T>], name: &str) -> Option<T> {
+    patterns
+        .iter()
+        .find(|p| p.key == name)
+        .or_else(|| patterns.iter().find(|p| p.re.is_match(name)))
+        .map(|p| p.value)
+}
+
+/// What [`Config::scale`] reads, compiled once.
+struct Scales {
+    r: usize,
+    alpha: f32,
+    rslora: bool,
+    ranks: Vec<Pattern<usize>>,
+    alphas: Vec<Pattern<f32>>,
 }
 
 impl Config {
@@ -95,32 +144,46 @@ impl Config {
                 "adapters with modules_to_save carry full weights, which are not supported",
             ));
         }
+        if self.alora_invocation_tokens.as_ref().is_some_and(|t| !t.is_empty()) {
+            return Err(invalid(
+                "activated LoRA adapters (alora_invocation_tokens) are not supported",
+            ));
+        }
         if !self.lora_alpha.is_finite() {
             return Err(invalid("lora_alpha is not finite"));
         }
         Ok(())
     }
 
+    fn scales(&self) -> Result<Scales> {
+        Ok(Scales {
+            r: self.r,
+            alpha: self.lora_alpha,
+            rslora: self.use_rslora,
+            ranks: patterns("rank_pattern", &self.rank_pattern, |v| v.as_u64().map(|r| r as usize))?,
+            alphas: patterns("alpha_pattern", &self.alpha_pattern, |v| v.as_f64().map(|a| a as f32))?,
+        })
+    }
+}
+
+impl Scales {
     /// PEFT's scale for the module named `name` (its key in the weights,
-    /// less the `.lora_A.weight` suffix): the most specific pattern whose
-    /// key the name ends with, as PEFT matches them.
-    fn scale(&self, name: &str) -> Result<f32> {
-        let pick = |keys: Vec<&String>| -> Option<String> {
-            keys.into_iter()
-                .filter(|k| name == k.as_str() || name.ends_with(&format!(".{k}")))
-                .max_by_key(|k| k.len())
-                .cloned()
-        };
-        let r = pick(self.rank_pattern.keys().collect())
-            .map(|k| self.rank_pattern[&k])
-            .unwrap_or(self.r);
-        let alpha = pick(self.alpha_pattern.keys().collect())
-            .map(|k| self.alpha_pattern[&k])
-            .unwrap_or(self.lora_alpha);
+    /// less `base_model.model.` and the `.lora_A.weight` suffix), whose
+    /// pair has rank `rank`.  The rank the config gives the module must be
+    /// the pair's: one that differs means a pattern was not read as PEFT
+    /// reads it, and the scale would be wrong.
+    fn scale(&self, name: &str, rank: usize) -> Result<f32> {
+        let r = pick(&self.ranks, name).unwrap_or(self.r);
+        let alpha = pick(&self.alphas, name).unwrap_or(self.alpha);
+        if r != rank {
+            return Err(invalid(format!(
+                "module '{name}' has rank {rank}, but the config gives it rank {r}"
+            )));
+        }
         if r == 0 || !alpha.is_finite() {
             return Err(invalid(format!("module '{name}' has rank 0 or a non-finite alpha")));
         }
-        Ok(if self.use_rslora {
+        Ok(if self.rslora {
             alpha / (r as f32).sqrt()
         } else {
             alpha / r as f32
@@ -208,7 +271,11 @@ pub fn load(files: &PeftFiles, table: &SlotTable, limits: &LoraLimits) -> Result
     let config: Config = serde_json::from_slice(&config_bytes)
         .map_err(|e| invalid(format!("{}: {e}", files.config.display())))?;
     config.check()?;
-    let len = std::fs::metadata(&files.weights)
+    let scales = config.scales()?;
+    let file = std::fs::File::open(&files.weights)
+        .map_err(|e| invalid(format!("{}: {e}", files.weights.display())))?;
+    let len = file
+        .metadata()
         .map_err(|e| invalid(format!("{}: {e}", files.weights.display())))?
         .len();
     if len > limits.max_bytes {
@@ -218,27 +285,34 @@ pub fn load(files: &PeftFiles, table: &SlotTable, limits: &LoraLimits) -> Result
             limits.max_bytes
         )));
     }
-    let weights = std::fs::read(&files.weights)
+    // SAFETY: the mapping is read-only and dropped before returning, as for
+    // a GGUF adapter.  Tensors are decoded one pair at a time from it, so
+    // the file is never held twice over.
+    let weights = unsafe { memmap2::Mmap::map(&file) }
         .map_err(|e| invalid(format!("{}: {e}", files.weights.display())))?;
     let mut hasher = Sha256::new();
     hasher.update(b"joshua/peft/v1");
     hasher.update((config_bytes.len() as u64).to_le_bytes());
     hasher.update(&config_bytes);
-    hasher.update(&weights);
+    hasher.update(&weights[..]);
     let digest: [u8; 32] = hasher.finalize().into();
-    let tensors = candle_core::safetensors::load_buffer(&weights, &Device::Cpu)
+    let tensors = candle_core::safetensors::SliceSafetensors::new(&weights)
         .map_err(|e| invalid(format!("{}: {e}", files.weights.display())))?;
-    drop(weights);
+    let load = |name: &str| {
+        tensors
+            .load(name, &Device::Cpu)
+            .map_err(|e| invalid(format!("tensor '{name}': {e}")))
+    };
 
     // Pair `<module>.lora_A.weight` with `<module>.lora_B.weight`, in name
-    // order so the first error does not depend on hash order.
-    let mut halves: BTreeMap<String, (Option<&Tensor>, Option<&Tensor>)> = BTreeMap::new();
-    for (name, t) in &tensors {
+    // order so the first error does not depend on the file's order.
+    let mut halves: BTreeMap<String, (Option<String>, Option<String>)> = BTreeMap::new();
+    for (name, _) in tensors.tensors() {
         let entry = |m: &str| m.strip_prefix("base_model.model.").unwrap_or(m).to_string();
         if let Some(m) = name.strip_suffix(".lora_A.weight") {
-            halves.entry(entry(m)).or_default().0 = Some(t);
+            halves.entry(entry(m)).or_default().0 = Some(name.clone());
         } else if let Some(m) = name.strip_suffix(".lora_B.weight") {
-            halves.entry(entry(m)).or_default().1 = Some(t);
+            halves.entry(entry(m)).or_default().1 = Some(name.clone());
         } else if name.contains("lora_magnitude_vector") {
             return Err(invalid("DoRA adapters are not supported"));
         } else if name.contains("lora_embedding_") {
@@ -255,7 +329,7 @@ pub fn load(files: &PeftFiles, table: &SlotTable, limits: &LoraLimits) -> Result
     let mut total = 0u64;
     let mut seen = std::collections::BTreeSet::new();
     for (module, ab) in &halves {
-        let (Some(a), Some(b)) = *ab else {
+        let (Some(a), Some(b)) = ab else {
             return Err(invalid(format!("LoRA pair for '{module}' is missing one component")));
         };
         let base = gguf_base(module).map_err(|why| invalid(format!("'{module}' {why}")))?;
@@ -265,8 +339,8 @@ pub fn load(files: &PeftFiles, table: &SlotTable, limits: &LoraLimits) -> Result
         if !seen.insert(key) {
             return Err(invalid(format!("'{module}' targets {base} a second time")));
         }
-        let (a_dims, a) = to_f32(module, a)?;
-        let (b_dims, mut b) = to_f32(module, b)?;
+        let (a_dims, a) = to_f32(module, &load(a)?)?;
+        let (b_dims, mut b) = to_f32(module, &load(b)?)?;
         let (&[rank, a_in], &[b_out, b_rank]) = (&a_dims[..], &b_dims[..]) else {
             return Err(invalid(format!("'{module}' has incorrect shape (hint: maybe wrong base model?)")));
         };
@@ -293,7 +367,7 @@ pub fn load(files: &PeftFiles, table: &SlotTable, limits: &LoraLimits) -> Result
                 _ => {}
             }
         }
-        let scale = config.scale(module)?;
+        let scale = scales.scale(module, rank)?;
         b.iter_mut().for_each(|v| *v *= scale);
         let pair = LoraPair::new(a, b, rank, n_in, n_out, table.device()).map_err(invalid)?;
         pairs.push((key, Arc::new(pair)));
@@ -341,13 +415,27 @@ mod tests {
         let config = |extra: &str| -> Config {
             serde_json::from_str(&format!(r#"{{"r": 8, "lora_alpha": 16{extra}}}"#)).unwrap()
         };
-        assert_eq!(config("").scale("model.layers.0.self_attn.q_proj").unwrap(), 2.0);
-        let rs = config(r#", "use_rslora": true"#);
-        assert!((rs.scale("x").unwrap() - 16.0 / 8f32.sqrt()).abs() < 1e-6);
-        let pat = config(r#", "rank_pattern": {"q_proj": 4}, "alpha_pattern": {"layers.0.self_attn.q_proj": 2}"#);
-        assert_eq!(pat.scale("model.layers.0.self_attn.q_proj").unwrap(), 0.5);
-        assert_eq!(pat.scale("model.layers.1.self_attn.q_proj").unwrap(), 4.0);
-        assert_eq!(pat.scale("model.layers.1.self_attn.v_proj").unwrap(), 2.0);
+        let scales = |extra: &str| config(extra).scales().unwrap();
+        assert_eq!(scales("").scale("model.layers.0.self_attn.q_proj", 8).unwrap(), 2.0);
+        let rs = scales(r#", "use_rslora": true"#);
+        assert!((rs.scale("x", 8).unwrap() - 16.0 / 8f32.sqrt()).abs() < 1e-6);
+        let pat = scales(r#", "rank_pattern": {"q_proj": 4}, "alpha_pattern": {"layers.0.self_attn.q_proj": 2}"#);
+        assert_eq!(pat.scale("model.layers.0.self_attn.q_proj", 4).unwrap(), 0.5);
+        assert_eq!(pat.scale("model.layers.1.self_attn.q_proj", 4).unwrap(), 4.0);
+        assert_eq!(pat.scale("model.layers.1.self_attn.v_proj", 8).unwrap(), 2.0);
+        // Keys are regular expressions, matched as PEFT matches them: the
+        // whole name, or a dotted suffix of it; the first match wins.
+        let re = scales(r#", "rank_pattern": {"q_proj$": 4, "layers\\.[01]\\..*v_proj": 2, "v_proj": 16}"#);
+        assert_eq!(re.scale("model.layers.0.self_attn.q_proj", 4).unwrap(), 4.0);
+        assert_eq!(re.scale("model.layers.1.self_attn.v_proj", 2).unwrap(), 8.0);
+        assert_eq!(re.scale("model.layers.2.self_attn.v_proj", 16).unwrap(), 1.0);
+        // `proj` alone matches no dotted suffix.
+        assert_eq!(scales(r#", "rank_pattern": {"proj": 4}"#).scale("model.layers.0.mlp.up_proj", 8).unwrap(), 2.0);
+        // A rank the config does not give the pair is refused, not mis-scaled.
+        assert!(pat.scale("model.layers.0.self_attn.q_proj", 8).is_err());
+        assert!(config(r#", "rank_pattern": {"(": 4}"#).scales().is_err());
+        assert!(config(r#", "alora_invocation_tokens": [101, 102]"#).check().is_err());
+        assert!(config(r#", "alora_invocation_tokens": null"#).check().is_ok());
         assert!(config(r#", "use_dora": true"#).check().is_err());
         assert!(config(r#", "bias": "all""#).check().is_err());
         assert!(config(r#", "modules_to_save": ["lm_head"]"#).check().is_err());

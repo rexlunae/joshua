@@ -230,6 +230,11 @@ impl SlotTable {
         for &r in &self.recurrent {
             hash.update([u8::from(r)]);
         }
+        // A PEFT adapter's Q/K rows are permuted for these head counts.
+        let (n_head, n_kv_head) = self.rope_permute.unwrap_or((0, 0));
+        hash.update([u8::from(self.rope_permute.is_some())]);
+        hash.update((n_head as u64).to_le_bytes());
+        hash.update((n_kv_head as u64).to_le_bytes());
         hash.finalize().into()
     }
 
@@ -1357,6 +1362,13 @@ mod tests {
         assert_eq!(a.fingerprint(), b.fingerprint());
         b.insert(SlotKey::new(1, Proj::AttnQ), 16, 9);
         assert_ne!(a.fingerprint(), b.fingerprint());
+        // The interleaved-RoPE layout a PEFT adapter is permuted for.
+        let mut c = table();
+        c.set_rope_permute(2, 2);
+        assert_ne!(a.fingerprint(), c.fingerprint());
+        let mut d = table();
+        d.set_rope_permute(4, 2);
+        assert_ne!(c.fingerprint(), d.fingerprint());
     }
 
     #[test]
