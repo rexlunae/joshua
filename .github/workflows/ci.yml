@@ -67,6 +67,30 @@ jobs:
       - name: Test
         run: cargo test --release --tests
 
+  # The client libraries people point at llama.cpp, vLLM and Ollama servers
+  # (openai and ollama, Python and Node), driven against a live
+  # `joshua serve` on the tiny test model.  See clients/README.md.
+  clients:
+    name: real-client tests (openai, ollama)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.89.0
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Run the client suites
+        run: scripts/client-tests.sh
+        env:
+          CARGO_PROFILE_DEV_DEBUG: 0
+
   # The joshua-ui web frontend (crates/joshua-ui). It is a workspace member
   # but not a default member, so the jobs above never build it; this job
   # checks it for both the host (where its API-client unit tests run) and

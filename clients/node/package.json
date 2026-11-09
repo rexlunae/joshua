@@ -1,0 +1,12 @@
+{
+  "name": "joshua-client-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test.mjs"
+  },
+  "dependencies": {
+    "ollama": "0.6.4",
+    "openai": "7.54.0"
+  }
+}
