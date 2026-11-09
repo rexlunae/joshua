@@ -198,6 +198,87 @@ fn adapter_matches_merged_weights() {
     }
 }
 
+/// candle's quantized loaders that take the LoRA hook: an adapter on every
+/// projection each lists matches the merged model, and the base model is
+/// bit-identical with the hook removed.
+#[test]
+fn vendored_loaders_match_merged_weights() {
+    let (alpha, r, user) = (8.0, 4, 0.8);
+    let wants: &[(&str, &[&str])] = &[
+        ("llama", &["attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up", "ffn_down"]),
+        ("qwen2", &["attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up", "ffn_down"]),
+        ("gemma3", &["attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_up", "ffn_down"]),
+        ("phi3", &["attn_qkv", "attn_output", "ffn_up", "ffn_down"]),
+    ];
+    for &(arch, projs) in wants {
+        let path = fixture("vendored", arch, |p| common::write_tiny_gguf(p, arch));
+        let dir = path.parent().unwrap();
+        let mut model = load(&path);
+        let table = model.lora_slots().unwrap_or_else(|| panic!("{arch}: no LoRA slots"));
+        assert_eq!(table.arch(), arch);
+        let mut listed: Vec<_> = table.iter().map(|(k, _, _)| k.proj.gguf_name()).collect();
+        listed.sort();
+        let mut expected = projs.to_vec();
+        expected.sort();
+        assert_eq!(listed, expected, "{arch}");
+
+        let base = run(&mut model);
+        let specs = specs(&table, r, 100, |_| true);
+        let lora = adapter(&model, &write_adapter(dir, "adapter.gguf", &table, alpha, &specs));
+        let set = active(&[(lora, user)]).unwrap();
+        assert!(model.set_adapters(Some(Arc::clone(&set))).unwrap(), "{arch}");
+        assert_eq!(model.adapter_key(), Some(set.key()));
+        assert!(!model.set_adapters(Some(Arc::clone(&set))).unwrap(), "{arch}: same set");
+        let got = run(&mut model);
+
+        let merged = dir.join("merged.gguf");
+        let deltas: Vec<_> = specs.iter().map(|s| (s, eff(user, alpha, s.r))).collect();
+        common::write_merged_gguf(&path, &merged, &deltas);
+        let want = run(&mut load(&merged));
+        assert_runs_close(&got, &want, 1e-4, &format!("{arch}: adapter vs merged"));
+        assert!(max_diff(&got, &base) > 2e-3, "{arch}: the adapter barely moves the logits");
+
+        assert!(model.set_adapters(None).unwrap(), "{arch}");
+        assert_eq!(model.adapter_key(), None);
+        assert_eq!(run(&mut model), base, "{arch}: base model after the hook is removed");
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+/// The engine runs an adapter on a candle loader per request, and a pooled
+/// session that ran it goes back to the base model for the next request.
+#[test]
+fn engine_runs_adapters_on_vendored_loaders() {
+    use joshua::types::{GenerationOptions, LoraScale};
+    use joshua::{Engine, RawPrompt};
+
+    for arch in ["llama", "gemma3"] {
+        let path = fixture("engine-vendored", arch, |p| common::write_tiny_gguf(p, arch));
+        let table = load(&path).lora_slots().unwrap();
+        let file = write_adapter(path.parent().unwrap(), "a.gguf", &table, 0.0, &specs(&table, 2, 7, |_| true));
+        let engine = Engine::with_n_ctx(&path, 64).unwrap();
+        let id = engine.load_lora(&file, None, 0.0).unwrap().id;
+        let run = |lora: Option<Vec<LoraScale>>| {
+            let options = GenerationOptions {
+                max_tokens: 3,
+                min_tokens: 3,
+                temperature: 0.0,
+                logprobs: Some(1),
+                lora,
+                ..Default::default()
+            };
+            let done = engine.complete_prompt(&RawPrompt::tokens(PROMPT.to_vec()), &options).unwrap();
+            done.logprobs.iter().map(|l| (l.token, l.logprob)).collect::<Vec<_>>()
+        };
+        let base = run(None);
+        let on = run(Some(vec![LoraScale { id, scale: 4.0 }]));
+        assert_ne!(on, base, "{arch}");
+        assert_eq!(run(None), base, "{arch}: base after the adapter");
+        assert_eq!(run(Some(vec![LoraScale { id, scale: 4.0 }])), on, "{arch}");
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+}
+
 /// Two adapters at once (overlapping targets, one with alpha 0, one with a
 /// negative scale) match the model with both deltas merged; the selection
 /// order changes neither the key nor a single bit of the output.
@@ -933,11 +1014,19 @@ fn adapters_are_refused_where_they_cannot_apply() {
         1.0,
     )]);
 
+    // A loader that takes adapters refuses one validated against another
+    // model, and stays on the base model.
     let llama = dir.join("llama.gguf");
     common::write_tiny_llama_gguf(&llama);
+    let mut m = load(&llama);
+    assert!(m.supports_lora());
+    let err = m.set_adapters(set.clone()).unwrap_err().to_string();
+    assert!(err.contains("different base model"), "{err}");
+    assert_eq!(m.adapter_key(), None);
+
     let deepseek = dir.join("deepseek2.gguf");
     common::write_tiny_deepseek2_gguf(&deepseek);
-    for (what, other) in [("llama", llama), ("deepseek2", deepseek)] {
+    for (what, other) in [("deepseek2", deepseek)] {
         let mut m = load(&other);
         assert!(!m.supports_lora(), "{what}");
         assert!(m.lora_slots().is_none(), "{what}");

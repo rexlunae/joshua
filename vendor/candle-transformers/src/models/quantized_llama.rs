@@ -17,7 +17,9 @@
 //!
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use super::lora_hook::{At, LinearDelta, LoraSlots};
 use crate::quantized_nn::RmsNorm;
 use candle::quantized::QTensor;
 use candle::quantized::{ggml_file, gguf_file};
@@ -53,12 +55,18 @@ struct Mlp {
     feed_forward_w3: QMatMul,
 }
 
+impl Mlp {
+    fn forward_at(&self, xs: &Tensor, at: At<'_>) -> Result<Tensor> {
+        let w1 = at.mm("ffn_gate", xs, self.feed_forward_w1.forward(xs)?)?;
+        let w3 = at.mm("ffn_up", xs, self.feed_forward_w3.forward(xs)?)?;
+        let h = (candle_nn::ops::silu(&w1)? * w3)?;
+        at.mm("ffn_down", &h, self.feed_forward_w2.forward(&h)?)
+    }
+}
+
 impl Module for Mlp {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let w1 = self.feed_forward_w1.forward(xs)?;
-        let w3 = self.feed_forward_w3.forward(xs)?;
-        self.feed_forward_w2
-            .forward(&(candle_nn::ops::silu(&w1)? * w3)?)
+        self.forward_at(xs, At::none())
     }
 }
 
@@ -142,6 +150,17 @@ impl Module for MlpOrMoe {
     }
 }
 
+impl MlpOrMoe {
+    /// [`Module::forward`] with the LoRA hook on a dense MLP; experts take
+    /// no delta.
+    fn forward_at(&self, xs: &Tensor, at: At<'_>) -> Result<Tensor> {
+        match self {
+            Self::Mlp(mlp) => mlp.forward_at(xs, at),
+            Self::MoE { .. } => self.forward(xs),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct LayerWeights {
     attention_wq: QMatMul,
@@ -193,12 +212,13 @@ impl LayerWeights {
         x: &Tensor,
         mask: Option<&Tensor>,
         index_pos: usize,
+        at: At<'_>,
     ) -> Result<Tensor> {
         let _enter = self.span_attn.enter();
         let (b_sz, seq_len, n_embd) = x.dims3()?;
-        let q = self.attention_wq.forward(x)?;
-        let k = self.attention_wk.forward(x)?;
-        let v = self.attention_wv.forward(x)?;
+        let q = at.mm("attn_q", x, self.attention_wq.forward(x)?)?;
+        let k = at.mm("attn_k", x, self.attention_wk.forward(x)?)?;
+        let v = at.mm("attn_v", x, self.attention_wv.forward(x)?)?;
 
         let q = q
             .reshape((b_sz, seq_len, self.n_head, self.head_dim))?
@@ -267,7 +287,7 @@ impl LayerWeights {
         let y = y
             .transpose(1, 2)?
             .reshape(&[b_sz, seq_len, self.n_head * self.head_dim])?;
-        let y = self.attention_wo.forward(&y)?;
+        let y = at.mm("attn_output", &y, self.attention_wo.forward(&y)?)?;
         Ok(y)
     }
 }
@@ -284,6 +304,11 @@ pub struct ModelWeights {
     masks: HashMap<(usize, usize), Tensor>,
     span: tracing::Span,
     span_output: tracing::Span,
+    /// `general.architecture` (`llama` for a GGML file).
+    arch: String,
+    /// LoRA deltas added after the dense projections (see
+    /// [`super::lora_hook`]).
+    lora: Option<Arc<dyn LinearDelta>>,
 }
 
 fn precomput_freqs_cis(
@@ -368,6 +393,8 @@ impl ModelWeights {
             masks: HashMap::new(),
             span,
             span_output,
+            arch: "llama".to_string(),
+            lora: None,
         })
     }
 
@@ -545,7 +572,44 @@ impl ModelWeights {
             masks: HashMap::new(),
             span,
             span_output,
+            arch,
+            lora: None,
         })
+    }
+
+    /// `general.architecture`.
+    pub fn arch(&self) -> &str {
+        &self.arch
+    }
+
+    /// The projections a LoRA delta can be added to: each decoder layer's
+    /// attention projections and, for a dense layer, its MLP.
+    pub fn lora_slots(&self) -> LoraSlots {
+        let mut out = LoraSlots::new(self.arch.as_str(), self.layers.len());
+        for (l, layer) in self.layers.iter().enumerate() {
+            let push = |out: &mut LoraSlots, proj, w: &QMatMul| out.push(l, proj, &w.inner);
+            push(&mut out, "attn_q", &layer.attention_wq);
+            push(&mut out, "attn_k", &layer.attention_wk);
+            push(&mut out, "attn_v", &layer.attention_wv);
+            push(&mut out, "attn_output", &layer.attention_wo);
+            if let MlpOrMoe::Mlp(mlp) = &layer.mlp_or_moe {
+                push(&mut out, "ffn_gate", &mlp.feed_forward_w1);
+                push(&mut out, "ffn_up", &mlp.feed_forward_w3);
+                push(&mut out, "ffn_down", &mlp.feed_forward_w2);
+            }
+        }
+        out
+    }
+
+    /// Run later forward passes with `hook`'s deltas (`None`: the base
+    /// model).  The KV cache is the caller's to clear.
+    pub fn set_lora(&mut self, hook: Option<Arc<dyn LinearDelta>>) {
+        self.lora = hook;
+    }
+
+    /// The installed LoRA hook.
+    pub fn lora(&self) -> Option<&Arc<dyn LinearDelta>> {
+        self.lora.as_ref()
     }
 
     /// Build a causal attention mask of shape `(seq_len, kv_len)` where
@@ -599,18 +663,20 @@ impl ModelWeights {
         };
         let _enter = self.span.enter();
         let mut layer_in = self.tok_embeddings.forward(x)?;
-        for layer in self.layers.iter_mut() {
+        let hook = self.lora.clone();
+        for (l, layer) in self.layers.iter_mut().enumerate() {
+            let at = At { hook: hook.as_deref(), layer: l };
             let x = layer_in;
             let residual = &x;
             let x = layer.attention_norm.forward(&x)?;
-            let attn = layer.forward_attn(&x, mask.as_ref(), index_pos)?;
+            let attn = layer.forward_attn(&x, mask.as_ref(), index_pos, at)?;
             let x = (attn + residual)?;
 
             // MLP
             let _enter = layer.span_mlp.enter();
             let residual = &x;
             let x = layer.ffn_norm.forward(&x)?;
-            let x = layer.mlp_or_moe.forward(&x)?;
+            let x = layer.mlp_or_moe.forward_at(&x, at)?;
             let x = (x + residual)?;
             layer_in = x
         }

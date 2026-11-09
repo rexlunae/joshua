@@ -422,6 +422,8 @@ pub fn write_tiny_gguf_with(path: &Path, arch: &str, extra: &[(String, gguf_file
         "llama" => (2usize, 2usize, 4usize),
         "qwen2" => (2, 1, 4),
         "qwen3" => (2, 1, 6),
+        "gemma3" => (2, 1, 4),
+        "phi3" => (2, 2, 4),
         other => panic!("unsupported synthetic arch {other}"),
     };
 
@@ -529,6 +531,18 @@ pub fn write_tiny_gguf_with(path: &Path, arch: &str, extra: &[(String, gguf_file
             // Qwen3-Embedding style last-token pooling.
             metadata.push((key("pooling_type"), gguf_file::Value::U32(3)));
         }
+        "gemma3" => {
+            for k in ["attention.key_length", "attention.value_length"] {
+                metadata.push((key(k), gguf_file::Value::U32(head_dim as u32)));
+            }
+            metadata.push((key("attention.sliding_window"), gguf_file::Value::U32(512)));
+        }
+        "phi3" => {
+            metadata.push((
+                key("rope.dimension_count"),
+                gguf_file::Value::U32(head_dim as u32),
+            ));
+        }
         _ => {}
     }
 
@@ -590,6 +604,37 @@ pub fn write_tiny_gguf_with(path: &Path, arch: &str, extra: &[(String, gguf_file
         tensors.push((
             "blk.0.attn_v.bias".to_string(),
             qtensor(weights(kv_dim, 11), &[kv_dim]),
+        ));
+    }
+    if arch == "gemma3" {
+        for (name, n, seed) in [
+            ("attn_q_norm", head_dim, 14),
+            ("attn_k_norm", head_dim, 15),
+            ("post_attention_norm", EMB, 16),
+            ("post_ffw_norm", EMB, 17),
+        ] {
+            tensors.push((format!("blk.0.{name}.weight"), qtensor(weights(n, seed), &[n])));
+        }
+    }
+    if arch == "phi3" {
+        // Fused `[q ‖ k ‖ v]` and `[gate ‖ up]`, and an untied output head.
+        tensors.retain(|(name, _)| {
+            !["attn_q.", "attn_k.", "attn_v.", "ffn_gate.", "ffn_up."]
+                .iter()
+                .any(|p| name.contains(p))
+        });
+        let qkv = q_dim + 2 * kv_dim;
+        tensors.push((
+            "blk.0.attn_qkv.weight".to_string(),
+            qtensor(weights(qkv * EMB, 18), &[qkv, EMB]),
+        ));
+        tensors.push((
+            "blk.0.ffn_up.weight".to_string(),
+            qtensor(weights(2 * FFN * EMB, 19), &[2 * FFN, EMB]),
+        ));
+        tensors.push((
+            "output.weight".to_string(),
+            qtensor(weights(VOCAB * EMB, 20), &[VOCAB, EMB]),
         ));
     }
     if arch == "qwen3" {

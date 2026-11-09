@@ -215,7 +215,11 @@ adapters, as llama.cpp's `convert_lora_to_gguf.py` writes them, for the
 startup model; `--lora-init-without-apply` loads them at scale 0.  Each is
 validated against the model's projections when it loads, and refused when it
 targets one the loader cannot add a delta to.  Adapters run on the native
-loaders (Qwen and its relatives); other architectures refuse them.  Ids
+loaders (Qwen and its relatives) and on the `llama` (Llama, Mistral and the
+other architectures it serves), `qwen2`, `gemma3` and `phi3` loaders, whose
+attention and dense MLP projections take a delta (Phi-3's fused `attn_qkv`
+and `[gate ‖ up]` `ffn_up` as they are; Mixtral's experts take none).  Other
+architectures refuse them.  Ids
 follow the order given and are never reused.
 
 A request runs the server-wide scales unless it sends its own `lora` list
