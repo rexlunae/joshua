@@ -661,6 +661,18 @@ enum Commands {
         /// Without it a pull reaches public addresses only.
         #[arg(long, env = "JOSHUA_ALLOW_PRIVATE_PULL")]
         allow_private_pull: bool,
+        /// LoRA adapter (a GGUF from llama.cpp's convert_lora_to_gguf.py) to
+        /// load for the startup model at scale 1, as llama-server's
+        /// `--lora`.  Repeatable; ids follow the order given, `--lora` first.
+        #[arg(long, value_name = "FNAME")]
+        lora: Vec<PathBuf>,
+        /// LoRA adapter at a scale of its own (`--lora-scaled FNAME SCALE`).
+        #[arg(long, num_args = 2, value_names = ["FNAME", "SCALE"])]
+        lora_scaled: Vec<String>,
+        /// Load the adapters at scale 0, to be turned on per request or with
+        /// `POST /lora-adapters`.
+        #[arg(long)]
+        lora_init_without_apply: bool,
         #[command(flatten)]
         sampling: SamplingArgs,
         /// Jinja chat template, or a file holding one, to render chats with
@@ -951,6 +963,9 @@ async fn main() -> anyhow::Result<()> {
             admission_queue_depth,
             max_output_tokens,
             allow_private_pull,
+            lora,
+            lora_scaled,
+            lora_init_without_apply,
             sampling,
             chat_template,
             chat_template_file,
@@ -998,6 +1013,9 @@ async fn main() -> anyhow::Result<()> {
             // Startup model first, so `opts`/`npu` are still available to it;
             // the registry then names it by the id the inventory lists its file
             // by, which needs the manager.
+            if model.is_none() && !(lora.is_empty() && lora_scaled.is_empty()) {
+                anyhow::bail!("--lora and --lora-scaled apply to the startup model: give --model");
+            }
             let engine = match &model {
                 Some(model) => {
                     let mut engine = Engine::with_options(model, opts.clone())?;
@@ -1009,6 +1027,21 @@ async fn main() -> anyhow::Result<()> {
                     }
                     if let Some(max) = max_output_tokens {
                         engine = engine.with_max_output_tokens(max);
+                    }
+                    let scaled = lora_scaled
+                        .chunks(2)
+                        .map(|pair| -> anyhow::Result<(PathBuf, f32)> {
+                            let scale = pair[1].parse::<f32>().map_err(|e| {
+                                anyhow::anyhow!("--lora-scaled {} {}: {e}", pair[0], pair[1])
+                            })?;
+                            Ok((PathBuf::from(&pair[0]), scale))
+                        })
+                        .collect::<anyhow::Result<Vec<_>>>()?;
+                    for (path, scale) in lora.iter().map(|p| (p.clone(), 1.0)).chain(scaled) {
+                        let scale = if lora_init_without_apply { 0.0 } else { scale };
+                        engine
+                            .load_lora(&path, None, scale)
+                            .map_err(|e| anyhow::anyhow!("LoRA adapter {}: {e}", path.display()))?;
                     }
                     Some(Arc::new(engine))
                 }

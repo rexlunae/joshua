@@ -1215,6 +1215,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/metrics/json", get(metrics_json))
         .route("/props", get(props))
         .route("/slots", get(slots))
+        .route(
+            "/lora-adapters",
+            get(crate::lora_api::list).post(crate::lora_api::set),
+        )
         .layer(middleware::from_fn_with_state(
             crate::job_admission::Admission::default(),
             crate::job_admission::admit,

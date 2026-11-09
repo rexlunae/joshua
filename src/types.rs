@@ -265,6 +265,15 @@ impl std::fmt::Debug for LogprobSink {
     }
 }
 
+/// One adapter's scale in a request's or the server's LoRA selection.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct LoraScale {
+    /// The adapter's id, as `GET /lora-adapters` lists it.
+    pub id: usize,
+    /// Its scale; 0 leaves it out.
+    pub scale: f32,
+}
+
 /// Parameters that control the token-generation process.
 ///
 /// Every field added after the first release defaults to "off", so a caller
@@ -274,6 +283,17 @@ pub struct GenerationOptions {
     /// Trusted caller's cache namespace; never accepted from request JSON.
     #[serde(skip)]
     pub cache_scope: Option<[u8; 32]>,
+    /// The LoRA scales this request runs with, by adapter id
+    /// (llama-server's `lora`, `[{"id": 0, "scale": 0.5}]`): an adapter left
+    /// out runs at 0.  `None` runs the server-wide scales (see
+    /// [`crate::lora_registry`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lora: Option<Vec<LoraScale>>,
+    /// The adapter set `lora` resolved to, filled in by the engine; part of
+    /// the request's cache namespace, so state computed under one set is
+    /// never continued under another.
+    #[serde(skip)]
+    pub adapters: Option<std::sync::Arc<crate::lora::ActiveSet>>,
     /// Maximum number of tokens to generate.  [`MAX_TOKENS_UNLIMITED`]
     /// generates until end of sequence or the end of the context window;
     /// the server's `--max-output-tokens` caps every request either way.
@@ -502,7 +522,15 @@ pub enum ConstraintSpec {
 
 impl GenerationOptions {
     pub(crate) fn cache_namespace(&self) -> Option<[u8; 32]> {
-        crate::affinity::namespace(self.cache_scope, self.context_window)
+        let namespace = crate::affinity::namespace(self.cache_scope, self.context_window);
+        match &self.adapters {
+            None => namespace,
+            Some(set) => Some(crate::affinity::digest(&[
+                b"lora",
+                &namespace.unwrap_or_default(),
+                &set.key().0,
+            ])),
+        }
     }
 
     /// Options whose sampler settings come from `defaults` (see
@@ -589,6 +617,8 @@ impl Default for GenerationOptions {
     fn default() -> Self {
         Self {
             cache_scope: None,
+            lora: None,
+            adapters: None,
             max_tokens: Self::default_max_tokens(),
             temperature: Self::default_temperature(),
             top_p: Self::default_top_p(),
@@ -914,6 +944,9 @@ pub struct SamplingParams {
     /// is rejected rather than ignored.
     #[serde(default)]
     pub dynatemp_range: Option<f32>,
+    /// llama-server's per-request LoRA scales (see [`GenerationOptions::lora`]).
+    #[serde(default)]
+    pub lora: Option<Vec<LoraScale>>,
 }
 
 impl SamplingParams {
@@ -1063,6 +1096,9 @@ impl SamplingParams {
         }
         if let Some(v) = &self.dry_sequence_breakers {
             options.dry.sequence_breakers = v.clone();
+        }
+        if let Some(v) = &self.lora {
+            options.lora = Some(v.clone());
         }
         if options.min_tokens > 0 && options.min_tokens > options.max_tokens {
             return Err(format!(

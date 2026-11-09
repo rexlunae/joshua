@@ -953,6 +953,13 @@ Two limits bound how much work a single client can demand, both tunable:
   regardless of the client's `max_tokens`, bounding single-request CPU time.
   A request that sets no `max_tokens` (or `-1`) runs to end of sequence up
   to this cap.
+- `--lora FNAME` and `--lora-scaled FNAME SCALE` load GGUF LoRA adapters for
+  the startup model (`--lora-init-without-apply` at scale 0); requests pick
+  scales with llama-server's `lora` list, and `GET`/`POST /lora-adapters`
+  list them and set the server-wide scales.  See
+  [docs/client-compatibility.md](docs/client-compatibility.md#lora-adapters).
+- `--allow-private-pull` lets Ollama's `/api/pull` fetch from this host and
+  private networks; without it a pull reaches public addresses only.
 - `--n-ctx` (default: 4096) is the context window — prompt plus generated
   tokens — the model is loaded with.  A request can narrow it with
   `context_window` but never widen it.
