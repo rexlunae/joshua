@@ -547,6 +547,10 @@ pub struct ModelManager {
     pub npu_backend: Option<Arc<dyn crate::npu::NpuBackend>>,
     pub max_concurrency: Option<usize>,
     pub max_output_tokens: Option<u32>,
+    /// Whether Ollama's `/api/pull` may fetch from this host, its private
+    /// networks and link-local addresses (`--allow-private-pull`); off, it
+    /// reaches public addresses only.
+    pub allow_private_pull: bool,
     /// Workers started without a model that this controller may place
     /// models on.
     #[cfg(feature = "distributed")]

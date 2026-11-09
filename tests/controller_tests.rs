@@ -46,6 +46,7 @@ fn manager(dir: &std::path::Path) -> ModelManager {
         npu_backend: None,
         max_concurrency: None,
         max_output_tokens: None,
+        allow_private_pull: false,
         #[cfg(feature = "distributed")]
         workers: Vec::new(),
         #[cfg(feature = "distributed")]

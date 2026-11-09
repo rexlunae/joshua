@@ -172,6 +172,13 @@ layers are skipped with a status line saying so.  An `https://` URL ending in
 newline-delimited status lines (`stream: false` answers once, at the end).
 Interrupted downloads start again rather than resuming.
 
+A pull connects to public addresses only: a name that resolves to this host,
+a private network or a link-local address (checked at every connection,
+redirects included) is refused, so the route cannot be used to reach
+services behind the server.  Start the server with `--allow-private-pull`
+(`JOSHUA_ALLOW_PRIVATE_PULL`) to pull from a registry of your own on the
+LAN.  `insecure` never takes registry.ollama.ai or hf.co off https.
+
 The download half sits behind the `pull` cargo feature, on by default; a
 server built without it answers `pull` with a 501 and the advice to place
 the file in the model directory.  Like the other management routes, `pull`,

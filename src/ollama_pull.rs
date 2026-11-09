@@ -37,7 +37,7 @@ use std::time::{Duration, Instant};
 use axum::{
     body::Body,
     extract::{Path as UrlPath, State},
-    http::{header, HeaderValue, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
@@ -133,7 +133,10 @@ impl PullSource {
         {
             return Err(format!("invalid model name `{name}`"));
         }
-        let scheme = if insecure { "http" } else { "https" };
+        // `insecure` is for a registry of one's own: the public ones are
+        // always spoken to over https.
+        let public = matches!(host, DEFAULT_REGISTRY | "hf.co" | "huggingface.co");
+        let scheme = if insecure && !public { "http" } else { "https" };
         Ok(Self::Registry {
             base: format!("{scheme}://{host}"),
             repository,
@@ -193,17 +196,49 @@ fn is_gguf(path: &Path) -> bool {
         .is_ok_and(|()| &magic == b"GGUF")
 }
 
+/// A file being written under a temporary name of its own (so concurrent
+/// requests never share one), removed when dropped unless it was moved
+/// into place: a failed, cancelled or abandoned request leaves nothing
+/// behind.
+struct Staged {
+    path: PathBuf,
+    kept: bool,
+}
+
+impl Staged {
+    fn new(dir: &Path, name: &str) -> Self {
+        Self {
+            path: dir.join(format!(".{name}.{}.partial", uuid::Uuid::new_v4().simple())),
+            kept: false,
+        }
+    }
+
+    /// Move the file to `to`, replacing what is there.
+    fn persist(mut self, to: &Path) -> std::io::Result<()> {
+        std::fs::rename(&self.path, to)?;
+        self.kept = true;
+        Ok(())
+    }
+}
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        if !self.kept {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// Put `source` (a blob) into the model directory as `<stem>.gguf`: a hard
 /// link where the filesystem allows, else a copy, through a temporary name
 /// so a reader never sees half a file.
 fn place(source: &Path, model_dir: &Path, stem: &str) -> std::io::Result<PathBuf> {
     let target = model_dir.join(format!("{stem}.gguf"));
-    let temp = model_dir.join(format!(".{stem}.gguf.placing"));
-    let _ = std::fs::remove_file(&temp);
-    if std::fs::hard_link(source, &temp).is_err() {
-        std::fs::copy(source, &temp)?;
+    let staged = Staged::new(model_dir, &format!("{stem}.gguf"));
+    if std::fs::hard_link(source, &staged.path).is_err() {
+        std::fs::copy(source, &staged.path)?;
     }
-    std::fs::rename(&temp, &target)?;
+    staged.persist(&target)?;
     Ok(target)
 }
 
@@ -273,9 +308,64 @@ fn download(
     Ok((completed, format!("{:x}", hash.finalize())))
 }
 
+/// Whether `ip` is an address on the public internet, as opposed to this
+/// host, its private networks or link-local ones: where a pull may connect
+/// unless the server allows private hosts.
+fn is_public(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            !(v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || a == 0
+                // Carrier-grade NAT, 100.64.0.0/10.
+                || (a == 100 && (64..128).contains(&b)))
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_public(IpAddr::V4(v4));
+            }
+            let first = v6.segments()[0];
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_multicast()
+                // Unique local fc00::/7 and link-local fe80::/10.
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
+/// The HTTP client a pull uses.  Unless `allow_private`, names are
+/// resolved to public addresses only, every connection (redirects
+/// included) checked at the address it actually dials, so a pull cannot be
+/// pointed at services on this host or its network.
 #[cfg(feature = "pull")]
-fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
+fn agent(allow_private: bool) -> ureq::Agent {
+    let mut builder = ureq::AgentBuilder::new();
+    if !allow_private {
+        builder = builder.resolver(|netloc: &str| -> std::io::Result<Vec<std::net::SocketAddr>> {
+            use std::net::ToSocketAddrs;
+            let addrs: Vec<_> = netloc.to_socket_addrs()?.collect();
+            let public: Vec<_> = addrs.iter().copied().filter(|a| is_public(a.ip())).collect();
+            if public.is_empty() && !addrs.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!(
+                        "{netloc} is a private address; start the server with --allow-private-pull \
+                         to pull from it"
+                    ),
+                ));
+            }
+            Ok(public)
+        });
+    }
+    builder
         .timeout_connect(Duration::from_secs(30))
         .timeout_read(Duration::from_secs(300))
         .user_agent(concat!("joshua/", env!("CARGO_PKG_VERSION")))
@@ -301,10 +391,11 @@ fn get(agent: &ureq::Agent, url: &str, accept: Option<&str>) -> Result<ureq::Res
 fn pull_blocking(
     model_dir: &Path,
     source: &PullSource,
+    allow_private: bool,
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(Value),
 ) -> Result<PathBuf, PullError> {
-    let agent = agent();
+    let agent = agent(allow_private);
     match source {
         PullSource::Registry { base, repository, tag, stem } => {
             progress(json!({ "status": "pulling manifest" }));
@@ -347,11 +438,11 @@ fn pull_blocking(
             } else {
                 std::fs::create_dir_all(blob.parent().unwrap_or(model_dir))
                     .map_err(|e| format!("creating the blob store: {e}"))?;
-                let partial = blob.with_extension("partial");
-                let mut file =
-                    File::create(&partial).map_err(|e| format!("creating {}: {e}", partial.display()))?;
+                let partial = Staged::new(blob.parent().unwrap_or(model_dir), &format!("sha256-{hex}"));
+                let mut file = File::create(&partial.path)
+                    .map_err(|e| format!("creating {}: {e}", partial.path.display()))?;
                 let response = get(&agent, &format!("{base}/v2/{repository}/blobs/{digest}"), None)?;
-                let fetched = download(
+                let (bytes, got) = download(
                     response.into_reader(),
                     &mut file,
                     &status,
@@ -359,21 +450,13 @@ fn pull_blocking(
                     size,
                     cancel,
                     progress,
-                );
+                )?;
                 drop(file);
-                let (bytes, got) = match fetched {
-                    Ok(done) => done,
-                    Err(e) => {
-                        let _ = std::fs::remove_file(&partial);
-                        return Err(e);
-                    }
-                };
                 progress(json!({ "status": "verifying sha256 digest" }));
                 if got != hex || size.is_some_and(|size| size != bytes) {
-                    let _ = std::fs::remove_file(&partial);
                     return Err(format!("digest mismatch: expected {digest}, got sha256:{got}").into());
                 }
-                std::fs::rename(&partial, &blob).map_err(|e| format!("storing the blob: {e}"))?;
+                partial.persist(&blob).map_err(|e| format!("storing the blob: {e}"))?;
             }
             if !is_gguf(&blob) {
                 return Err("the model layer is not a GGUF file".to_string().into());
@@ -387,21 +470,16 @@ fn pull_blocking(
                 .header("Content-Length")
                 .and_then(|n| n.parse::<u64>().ok());
             let target = model_dir.join(format!("{stem}.gguf"));
-            let partial = model_dir.join(format!(".{stem}.gguf.partial"));
-            let mut file =
-                File::create(&partial).map_err(|e| format!("creating {}: {e}", partial.display()))?;
+            let partial = Staged::new(model_dir, &format!("{stem}.gguf"));
+            let mut file = File::create(&partial.path)
+                .map_err(|e| format!("creating {}: {e}", partial.path.display()))?;
             let status = format!("downloading {stem}.gguf");
-            let fetched = download(response.into_reader(), &mut file, &status, None, total, cancel, progress);
+            download(response.into_reader(), &mut file, &status, None, total, cancel, progress)?;
             drop(file);
-            if let Err(e) = fetched {
-                let _ = std::fs::remove_file(&partial);
-                return Err(e);
-            }
-            if !is_gguf(&partial) {
-                let _ = std::fs::remove_file(&partial);
+            if !is_gguf(&partial.path) {
                 return Err(format!("{url} is not a GGUF file").into());
             }
-            std::fs::rename(&partial, &target).map_err(|e| format!("placing the model: {e}"))?;
+            partial.persist(&target).map_err(|e| format!("placing the model: {e}"))?;
             Ok(target)
         }
     }
@@ -411,6 +489,7 @@ fn pull_blocking(
 fn pull_blocking(
     _model_dir: &Path,
     _source: &PullSource,
+    _allow_private: bool,
     _cancel: &AtomicBool,
     _progress: &mut dyn FnMut(Value),
 ) -> Result<PathBuf, PullError> {
@@ -430,6 +509,7 @@ pub async fn pull(State(state): State<AppState>, Json(body): Json<Value>) -> Res
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(true);
     let source = PullSource::parse(name, insecure).map_err(ApiError::bad_request)?;
     let dir = model_dir(&state)?;
+    let allow_private = state.manager.as_ref().is_some_and(|m| m.allow_private_pull);
     if !cfg!(feature = "pull") {
         return Err(ApiError::new(
             StatusCode::NOT_IMPLEMENTED,
@@ -445,7 +525,7 @@ pub async fn pull(State(state): State<AppState>, Json(body): Json<Value>) -> Res
         let mut progress = |line: Value| {
             let _ = tx.send(line);
         };
-        let result = pull_blocking(&dir, &source, &flag, &mut progress);
+        let result = pull_blocking(&dir, &source, allow_private, &flag, &mut progress);
         match &result {
             Ok(_) => progress(json!({ "status": "success" })),
             Err(PullError::Failed(message)) => progress(json!({ "error": message })),
@@ -454,16 +534,7 @@ pub async fn pull(State(state): State<AppState>, Json(body): Json<Value>) -> Res
         result.map(|_| source.stem().to_string())
     });
     if stream {
-        let lines = futures_util::stream::unfold((rx, cancel), |(mut rx, cancel)| async move {
-            rx.recv()
-                .await
-                .map(|line| (Ok::<String, std::convert::Infallible>(format!("{line}\n")), (rx, cancel)))
-        });
-        let mut response = Body::from_stream(lines).into_response();
-        response
-            .headers_mut()
-            .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/x-ndjson"));
-        return Ok(response);
+        return Ok(crate::ollama::ndjson(rx, cancel));
     }
     // The whole pull, answered once it is done.
     let drain = async { while rx.recv().await.is_some() {} };
@@ -510,10 +581,12 @@ pub async fn upload_blob(
     tokio::fs::create_dir_all(&store)
         .await
         .map_err(|e| ApiError::internal(format!("creating the blob store: {e}")))?;
-    let partial = store.join(format!(".upload-{}", uuid::Uuid::new_v4().simple()));
+    // Removed when the request ends without storing it, the client going
+    // away mid-upload included (the handler's future is then dropped).
+    let partial = Staged::new(&store, "upload");
     let written = async {
         use tokio::io::AsyncWriteExt;
-        let mut file = tokio::fs::File::create(&partial)
+        let mut file = tokio::fs::File::create(&partial.path)
             .await
             .map_err(|e| ApiError::internal(format!("creating the blob: {e}")))?;
         let mut hash = Sha256::new();
@@ -531,21 +604,14 @@ pub async fn upload_blob(
         Ok::<_, ApiError>(format!("{:x}", hash.finalize()))
     }
     .await;
-    let got = match written {
-        Ok(got) => got,
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&partial).await;
-            return Err(e);
-        }
-    };
+    let got = written?;
     if got != expected {
-        let _ = tokio::fs::remove_file(&partial).await;
         return Err(ApiError::bad_request(format!(
             "digest mismatch: the upload is sha256:{got}, not {digest}"
         )));
     }
-    tokio::fs::rename(&partial, &path)
-        .await
+    partial
+        .persist(&path)
         .map_err(|e| ApiError::internal(format!("storing the blob: {e}")))?;
     Ok(StatusCode::CREATED)
 }
@@ -617,12 +683,11 @@ pub fn status_response(lines: Vec<Value>, stream: bool) -> Response {
         let last = lines.into_iter().last().unwrap_or_else(|| json!({ "status": "success" }));
         return Json(last).into_response();
     }
-    let body: String = lines.iter().map(|line| format!("{line}\n")).collect();
-    let mut response = body.into_response();
-    response
-        .headers_mut()
-        .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/x-ndjson"));
-    response
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    for line in lines {
+        let _ = tx.send(line);
+    }
+    crate::ollama::ndjson(rx, ())
 }
 
 #[cfg(test)]
@@ -657,6 +722,11 @@ mod tests {
             parse("hf.co/org/Repo-GGUF:Q4_K_M"),
             registry("https://hf.co", "org/Repo-GGUF", "Q4_K_M", "Repo-GGUF")
         );
+        // `insecure` never takes a public registry off https.
+        assert_eq!(
+            PullSource::parse("llama3.2", true).unwrap(),
+            registry("https://registry.ollama.ai", "library/llama3.2", "latest", "llama3.2")
+        );
         assert_eq!(
             PullSource::parse("localhost:5000/library/tiny", true).unwrap(),
             registry("http://localhost:5000", "library/tiny", "latest", "tiny")
@@ -670,6 +740,17 @@ mod tests {
         );
         for bad in ["", "../x", "a/../b", "x:a/b:", "https://example.com/model.bin", "http://e.com/m.gguf"] {
             assert!(PullSource::parse(bad, false).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_public_addresses_are_public() {
+        for ip in ["127.0.0.1", "10.1.2.3", "192.168.0.9", "172.20.0.1", "169.254.169.254",
+                   "100.100.0.1", "0.0.0.0", "::1", "fd00::1", "fe80::1", "::ffff:10.0.0.1"] {
+            assert!(!is_public(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["1.1.1.1", "104.21.0.1", "2606:4700::1111"] {
+            assert!(is_public(ip.parse().unwrap()), "{ip}");
         }
     }
 

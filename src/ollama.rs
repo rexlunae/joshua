@@ -1159,7 +1159,7 @@ fn stream_turn(
     load: Duration,
     release: Option<(AppState, String)>,
 ) -> Response {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
     let cancel = CancelOnDrop::new();
     let flag = cancel.flag();
     state.metrics.record_stream();
@@ -1170,7 +1170,7 @@ fn stream_turn(
         let split = plan.splits();
         let sink = plan.options.logprob_sink.clone();
         let send = |value: Value| {
-            let _ = tx.send(format!("{value}\n"));
+            let _ = tx.send(value);
         };
         // The entries released so far, when any is an answer token's.
         let take_logprobs = || {
@@ -1218,13 +1218,22 @@ fn stream_turn(
         }
     });
 
-    // The `cancel` guard must live as long as the response body: its Drop sets
-    // the flag that stops generation when the client disconnects.  Moving it
-    // into the unfold state ties its lifetime to the stream.
-    let stream = futures_util::stream::unfold((rx, cancel), |(mut rx, cancel)| async move {
-        rx.recv()
-            .await
-            .map(|line| (Ok::<String, std::convert::Infallible>(line), (rx, cancel)))
+    ndjson(rx, cancel)
+}
+
+/// Ollama's streamed answer: each object sent on `rx` as one line of
+/// newline-delimited JSON, the one framer every streaming Ollama route
+/// uses.  `guard` lives as long as the response body, so a guard such as
+/// [`CancelOnDrop`] stops the work behind the stream when the client
+/// disconnects.
+pub(crate) fn ndjson<G: Send + 'static>(
+    rx: tokio::sync::mpsc::UnboundedReceiver<Value>,
+    guard: G,
+) -> Response {
+    let stream = futures_util::stream::unfold((rx, guard), |(mut rx, guard)| async move {
+        rx.recv().await.map(|line| {
+            (Ok::<String, std::convert::Infallible>(format!("{line}\n")), (rx, guard))
+        })
     });
     let mut response = axum::body::Body::from_stream(stream).into_response();
     response.headers_mut().insert(

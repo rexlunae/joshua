@@ -20,13 +20,14 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
-fn manager(dir: &std::path::Path) -> ModelManager {
+fn manager(dir: &std::path::Path, allow_private: bool) -> ModelManager {
     ModelManager {
         model_dir: dir.to_path_buf(),
         engine_options: Arc::new(|_: &std::path::Path| EngineOptions::with_n_ctx(64)),
         npu_backend: None,
         max_concurrency: None,
         max_output_tokens: None,
+        allow_private_pull: allow_private,
         #[cfg(feature = "distributed")]
         workers: Vec::new(),
         #[cfg(feature = "distributed")]
@@ -34,10 +35,15 @@ fn manager(dir: &std::path::Path) -> ModelManager {
     }
 }
 
+/// The server under test, allowed to pull from the local mock registry.
 fn app(dir: &std::path::Path) -> Router {
+    server(dir, true)
+}
+
+fn server(dir: &std::path::Path, allow_private: bool) -> Router {
     create_router(Arc::new(ServerState {
         models: ModelRegistry::default(),
-        manager: Some(manager(dir)),
+        manager: Some(manager(dir, allow_private)),
         whisper: None,
         api_key: None,
         cors_origins: Vec::new(),
@@ -267,6 +273,22 @@ async fn blobs_upload_and_create_places_one() {
     assert_eq!(status, StatusCode::OK);
     let (status, _) = send(&app, "HEAD", "/api/blobs/sha256:..", Body::empty()).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    // An upload that breaks off leaves nothing behind either.
+    let broken = futures_util::stream::iter([
+        Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"GGUF")),
+        Err(std::io::Error::other("connection reset")),
+    ]);
+    let other = format!("sha256:{}", "c".repeat(64));
+    let (status, _) =
+        send(&app, "POST", &format!("/api/blobs/{other}"), Body::from_stream(broken)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let mut stored: Vec<String> = std::fs::read_dir(dir.join(".blobs"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    stored.sort();
+    assert_eq!(stored, [format!("sha256-{}", &digest["sha256:".len()..])]);
 
     // `files` naming the blob creates the model, streamed or not.
     let (status, lines) = post(
@@ -328,4 +350,19 @@ async fn blobs_upload_and_create_places_one() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{lines:?}");
     assert!(lines[0]["error"].as_str().unwrap().contains("not a GGUF"), "{lines:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pull_stays_off_private_addresses_unless_allowed() {
+    let dir = common::model_dir("ollama-pull-private");
+    let gguf = tiny_gguf(&dir);
+    let host = registry(gguf).await;
+    let app = server(&dir, false);
+    for name in [format!("{host}/library/tiny"), format!("http://{host}/files/tiny.gguf")] {
+        let (status, lines) = post(&app, "/api/pull", json!({"model": name, "insecure": true})).await;
+        assert_eq!(status, StatusCode::OK);
+        let error = lines.last().unwrap()["error"].as_str().unwrap_or_default();
+        assert!(error.contains("--allow-private-pull"), "{name}: {lines:?}");
+    }
+    assert!(!dir.join("tiny.gguf").exists());
 }

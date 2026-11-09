@@ -656,6 +656,11 @@ enum Commands {
         /// this ceiling (default 4096).
         #[arg(long, env = "JOSHUA_MAX_OUTPUT_TOKENS")]
         max_output_tokens: Option<u32>,
+        /// Let Ollama's `/api/pull` fetch from this host, private networks
+        /// and link-local addresses (a registry of your own on the LAN).
+        /// Without it a pull reaches public addresses only.
+        #[arg(long, env = "JOSHUA_ALLOW_PRIVATE_PULL")]
+        allow_private_pull: bool,
         #[command(flatten)]
         sampling: SamplingArgs,
         /// Jinja chat template, or a file holding one, to render chats with
@@ -945,6 +950,7 @@ async fn main() -> anyhow::Result<()> {
             queue_timeout_ms,
             admission_queue_depth,
             max_output_tokens,
+            allow_private_pull,
             sampling,
             chat_template,
             chat_template_file,
@@ -1019,6 +1025,7 @@ async fn main() -> anyhow::Result<()> {
                     npu_backend: npu,
                     max_concurrency,
                     max_output_tokens,
+                    allow_private_pull,
                     #[cfg(feature = "distributed")]
                     cluster_key: if workers.is_empty() {
                         None
