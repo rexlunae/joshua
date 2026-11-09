@@ -3966,6 +3966,25 @@ impl Engine {
         self.tokenize(&rendered.text, rendered.add_special_tokens)
     }
 
+    /// [`Engine::tokenize_chat`] for a turn that continues earlier tokens
+    /// (Ollama's `context`): the rendered turn without the BOS its template
+    /// puts first, which the earlier tokens already start with, and without
+    /// the tokenizer's special tokens.
+    pub fn tokenize_chat_turn(
+        &self,
+        messages: &[ChatMessage],
+        options: &GenerationOptions,
+    ) -> Result<Vec<u32>> {
+        let (messages, tools) = self.stable_chat(messages, None, false);
+        let rendered = self.render_chat(&messages, tools.as_deref(), options)?;
+        let bos = self.template_tokens.0.as_str();
+        let text = match rendered.text.strip_prefix(bos) {
+            Some(rest) if !bos.is_empty() => rest,
+            _ => rendered.text.as_str(),
+        };
+        self.tokenize(text, false)
+    }
+
     /// Each token's vocabulary entry as the tokenizer spells it (vLLM's
     /// `/tokenize` `token_strs`), e.g. `Ġhello` for a byte-level BPE.
     pub fn token_strings(&self, ids: &[u32]) -> Vec<String> {
@@ -4625,6 +4644,20 @@ impl Engine {
         on_text: &mut dyn FnMut(&str),
     ) -> Result<Completion> {
         self.complete_prompt_inner(prompt, options, Some(cancel), Some(TextSink::Text(on_text)))
+    }
+
+    /// [`Engine::complete_prompt_streaming`] with the text split into
+    /// reasoning and answer as it is decoded, from where the prompt leaves
+    /// the reasoning (open when it ends inside a reasoning block), as
+    /// [`Engine::complete_chat_streaming_split`] does for a chat.
+    pub fn complete_prompt_streaming_split(
+        &self,
+        prompt: &RawPrompt,
+        options: &GenerationOptions,
+        cancel: &AtomicBool,
+        on_split: &mut dyn FnMut(crate::reasoning::Split),
+    ) -> Result<Completion> {
+        self.complete_prompt_inner(prompt, options, Some(cancel), Some(TextSink::Split(on_split)))
     }
 
     fn complete_prompt_inner(
