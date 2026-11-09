@@ -351,9 +351,23 @@ fn is_public(ip: std::net::IpAddr) -> bool {
 
 /// Whether `ip` is one of this host's own addresses (a public one
 /// included), where services the firewall keeps from other hosts may
-/// listen: an address a socket can bind to is.
+/// listen.  A UDP socket "connected" to the address (no packet is sent)
+/// takes the source address the kernel's route picks, which is the address
+/// itself only when the route is a local one; unlike a test bind, this is
+/// not fooled by `ip_nonlocal_bind`.
 fn is_own_address(ip: std::net::IpAddr) -> bool {
-    std::net::UdpSocket::bind((ip, 0)).is_ok()
+    use std::net::{Ipv4Addr, Ipv6Addr, UdpSocket};
+    let any: std::net::IpAddr = if ip.is_ipv4() {
+        Ipv4Addr::UNSPECIFIED.into()
+    } else {
+        Ipv6Addr::UNSPECIFIED.into()
+    };
+    UdpSocket::bind((any, 0))
+        .and_then(|socket| {
+            socket.connect((ip, 9))?;
+            socket.local_addr()
+        })
+        .is_ok_and(|local| local.ip() == ip)
 }
 
 /// The HTTP client a pull uses.  Unless `allow_private`, names are
@@ -774,6 +788,15 @@ mod tests {
         }
         assert!(is_own_address("127.0.0.1".parse().unwrap()));
         assert!(!is_own_address("1.1.1.1".parse().unwrap()));
+        // This host's address on its outbound route (not loopback, the
+        // case a public address of its own takes) is its own; skipped on
+        // a host with no route out.
+        let outbound = std::net::UdpSocket::bind(("0.0.0.0", 0))
+            .and_then(|s| s.connect(("1.1.1.1", 9)).and_then(|()| s.local_addr()));
+        if let Ok(local) = outbound {
+            assert!(!local.ip().is_loopback(), "{local}");
+            assert!(is_own_address(local.ip()), "{local}");
+        }
     }
 
     #[test]
