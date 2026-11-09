@@ -174,6 +174,10 @@ fn not_found(id: &str) -> ApiError {
 pub struct ResponsesRequest {
     #[serde(default)]
     model: String,
+    /// llama-server's per-request LoRA scales, as on chat completions; an
+    /// empty list runs the base model even under an adapter's name.
+    #[serde(default)]
+    lora: Option<Vec<crate::types::LoraScale>>,
     #[serde(default)]
     input: Option<Value>,
     #[serde(default)]
@@ -292,6 +296,9 @@ impl ResponsesRequest {
             if let Some(format) = response_format(format)? {
                 body.insert("response_format".into(), format);
             }
+        }
+        if let Some(lora) = &self.lora {
+            body.insert("lora".into(), json!(lora));
         }
         if let Some(effort) = self
             .reasoning

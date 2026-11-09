@@ -6784,6 +6784,23 @@ impl Engine {
         Ok(info)
     }
 
+    /// Replace the LoRA adapter named `name` with the file at `path`,
+    /// keeping its id and server-wide scale; on any error the old one stays
+    /// loaded.  Idle sessions running the old one go back to the base model.
+    pub fn replace_lora(&self, name: &str, path: &Path) -> Result<crate::lora_registry::LoraInfo> {
+        let table = self.lora_table()?.ok_or_else(|| {
+            JoshuaError::InvalidRequest(
+                "LoRA adapters are not supported for this model's architecture".to_string(),
+            )
+        })?;
+        let (info, _) = self.lora.replace(name, path, &table)?;
+        for cached in self.model_pool().iter_mut() {
+            self.detach_unloaded_adapters(&mut cached.session, &mut cached.tokens);
+        }
+        tracing::info!(id = info.id, name = %info.name, path = %path.display(), "replaced a LoRA adapter");
+        Ok(info)
+    }
+
     /// Unload the LoRA adapter named `name`.  Idle pooled sessions running
     /// it go back to the base model (their state is cleared), so the
     /// adapter's weights are freed once the requests running it finish;

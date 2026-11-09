@@ -136,6 +136,35 @@ impl Registry {
         Ok(info)
     }
 
+    /// Replace the adapter named `name` with the one at `path`, keeping its
+    /// id and server-wide scale.  The new file is read and validated first:
+    /// on any error the old adapter stays loaded.  Returns the new entry and
+    /// the replaced adapter's digest.
+    pub fn replace(&self, name: &str, path: &Path, table: &SlotTable) -> Result<(LoraInfo, [u8; 32])> {
+        if self.id_of(name).is_none() {
+            return Err(JoshuaError::InvalidRequest(format!(
+                "no LoRA adapter named `{name}` is loaded"
+            )));
+        }
+        let adapter = Arc::new(LoraAdapter::load(path, table, &self.limits)?);
+        let mut inner = self.lock();
+        let Some(entry) = inner.entries.iter_mut().find(|e| e.info.name == name) else {
+            return Err(JoshuaError::InvalidRequest(format!(
+                "no LoRA adapter named `{name}` is loaded"
+            )));
+        };
+        let old = *entry.adapter.digest();
+        entry.info.path = path.to_path_buf();
+        entry.info.task_name = adapter.task_name().map(str::to_string);
+        entry.info.prompt_prefix = adapter.prompt_prefix().map(str::to_string);
+        entry.adapter = adapter;
+        let info = entry.info.clone();
+        inner
+            .sets
+            .retain(|set| set.adapters().iter().all(|(a, _)| *a.digest() != old));
+        Ok((info, old))
+    }
+
     /// Unload the adapter named `name`.  Sets already built with it stay
     /// valid for the requests running them; no new request selects it.
     pub fn unload(&self, name: &str) -> Result<LoraInfo> {

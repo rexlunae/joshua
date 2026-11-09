@@ -423,9 +423,10 @@ impl ModelRegistry {
     }
 
     /// The loaded model with a LoRA adapter named `name`: its engine and
-    /// the adapter's id.  A model's own id is never an adapter's name here:
+    /// the adapter's id.  Names are unique across models (see
+    /// [`crate::lora_api::vllm_load`]).  A model's own id is never an adapter's name here:
     /// callers look models up first.
-    fn adapter(&self, name: &str) -> Option<(Arc<Engine>, usize)> {
+    pub(crate) fn adapter(&self, name: &str) -> Option<(Arc<Engine>, usize)> {
         let models = self.models.read().unwrap_or_else(|p| p.into_inner());
         models
             .iter()
@@ -1092,7 +1093,11 @@ pub(crate) async fn select_generation(
     requested: &str,
 ) -> Result<Selected, ApiError> {
     let name = requested.trim();
-    if state.models.loaded(name).is_none() {
+    // A model's id (loaded, or a model-directory file a request may load)
+    // wins over an adapter's name.
+    let a_model = state.models.loaded(name).is_some()
+        || state.unloaded().iter().any(|(id, _)| id == name);
+    if !a_model {
         if let Some((engine, id)) = state.models.adapter(name) {
             return Ok(Selected {
                 model: name.to_string(),
@@ -1914,14 +1919,24 @@ async fn worker_info(State(state): State<AppState>) -> Result<Json<WorkerInfo>, 
             })
             .collect(),
         model: first.map(|model| model.id.clone()).unwrap_or_else(|| state.whisper.as_ref().unwrap().model_name().to_string()),
+        // Each LoRA adapter is a model of its own name (vLLM's
+        // adapter-named models), admitted on its base engine's slots.
         models: models
                 .iter()
-                .map(|m| ModelSlots {
-                    id: m.id.clone(),
-                    n_ctx: Some(m.engine.n_ctx()),
-                    max_concurrency: m.engine.max_concurrency(),
-                    in_flight: m.engine.in_flight(),
-                    embeddings: m.engine.supports_embeddings(),
+                .flat_map(|m| {
+                    let slots = |id: String, embeddings| ModelSlots {
+                        id,
+                        n_ctx: Some(m.engine.n_ctx()),
+                        max_concurrency: m.engine.max_concurrency(),
+                        in_flight: m.engine.in_flight(),
+                        embeddings,
+                    };
+                    std::iter::once(slots(m.id.clone(), m.engine.supports_embeddings())).chain(
+                        m.engine
+                            .lora_adapters()
+                            .into_iter()
+                            .map(move |a| slots(a.name, false)),
+                    )
                 })
                 .collect(),
         n_ctx: first.map_or(0, |model| model.engine.n_ctx()),

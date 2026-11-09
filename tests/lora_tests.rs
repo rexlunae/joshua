@@ -1287,10 +1287,27 @@ async fn vllm_runtime_lora_routes_and_adapter_named_models() {
     let missing = json!({"lora_name": "x", "lora_path": path.with_file_name("missing.gguf").display().to_string()});
     let (status, _) = call(app.clone(), "POST", "/v1/load_lora_adapter", missing).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "no such file");
-    // Replaced in place, it keeps its name.
+    // Replaced in place, it keeps its name and id.
+    let id = engine.lora_id("style").unwrap();
     let inplace = json!({"lora_name": "style", "lora_path": file.display().to_string(), "load_inplace": true});
     let (status, text) = call(app.clone(), "POST", "/v1/load_lora_adapter", inplace).await;
     assert_eq!(status, StatusCode::OK, "{text}");
+    assert_eq!(engine.lora_id("style"), Some(id));
+    // A replacement that does not load leaves the adapter it would replace.
+    let junk = path.with_file_name("junk.gguf");
+    std::fs::write(&junk, b"not a gguf").unwrap();
+    let bad = json!({"lora_name": "style", "lora_path": junk.display().to_string(), "load_inplace": true});
+    let (status, _) = call(app.clone(), "POST", "/v1/load_lora_adapter", bad).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(engine.lora_id("style"), Some(id), "the old adapter stays");
+
+    // A router admits requests by the names a worker reports.
+    let (_, info) = call(app.clone(), "GET", "/v1/worker/info", Value::Null).await;
+    let info: Value = serde_json::from_str(&info).unwrap();
+    assert!(
+        info["models"].as_array().unwrap().iter().any(|m| m["id"] == "style"),
+        "{info}"
+    );
 
     // Listed as a model whose parent is the base.
     let (_, models) = call(app.clone(), "GET", "/v1/models", Value::Null).await;
@@ -1327,6 +1344,19 @@ async fn vllm_runtime_lora_routes_and_adapter_named_models() {
     // A request's own list still wins over the name.
     let off = chat("style", Some(json!([]))).await;
     assert_eq!(off["choices"][0]["logprobs"], base["choices"][0]["logprobs"]);
+    // So does /v1/responses, whose `lora` list reaches the engine.
+    let responses = |lora: Value| {
+        call(
+            app.clone(),
+            "POST",
+            "/v1/responses",
+            json!({"model": "style", "input": "hi", "max_output_tokens": 2, "temperature": 0, "lora": lora}),
+        )
+    };
+    let (status, text) = responses(json!([])).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let (status, text) = responses(json!([{"id": 99, "scale": 1.0}])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
     // The raw completions route takes the name too.
     let (status, text) = call(
         app.clone(),

@@ -9,6 +9,7 @@
 //! request's `model` (see [`crate::server::select_generation`]).
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use axum::{
     extract::{Query, State},
@@ -47,6 +48,9 @@ pub async fn set(
     engine.set_lora_scales(&scales).map_err(ApiError::from)?;
     Ok(Json(json!({ "success": true })))
 }
+
+/// Serialises runtime adapter loads (see [`vllm_load`]).
+static RUNTIME_LOADS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// vLLM's `POST /v1/load_lora_adapter` body.
 #[derive(Debug, Deserialize)]
@@ -101,17 +105,32 @@ pub async fn vllm_load(
             "Both 'lora_name' and 'lora_path' must be provided.",
         ));
     }
+    // Adapter names are model names: unique across the loaded models'
+    // adapters and never a model's id.  Runtime loads are serialised so
+    // two of one name cannot both pass the check.
+    let _serial = RUNTIME_LOADS.lock().await;
     let (_, engine) = select_model(&state, req.model.as_deref().unwrap_or_default()).await?;
-    if state.models.list().iter().any(|m| m.id == name) {
+    let a_model = state.models.list().iter().any(|m| m.id == name)
+        || state.unloaded().iter().any(|(id, _)| *id == name);
+    if a_model {
         return Err(ApiError::bad_request(format!(
             "'{name}' is a model's id; an adapter needs a name of its own"
         )));
     }
-    if engine.lora_id(&name).is_some() && !req.load_inplace {
-        return Err(ApiError::bad_request(format!(
-            "The lora adapter '{name}' has already been loaded."
-        )));
-    }
+    let replace = match state.models.adapter(&name) {
+        Some((owner, _)) if !Arc::ptr_eq(&owner, &engine) => {
+            return Err(ApiError::bad_request(format!(
+                "The lora adapter '{name}' has already been loaded for another model."
+            )))
+        }
+        Some(_) if !req.load_inplace => {
+            return Err(ApiError::bad_request(format!(
+                "The lora adapter '{name}' has already been loaded."
+            )))
+        }
+        Some(_) => true,
+        None => false,
+    };
     let path = PathBuf::from(req.lora_path.trim());
     if let Err(e) = std::fs::metadata(&path) {
         return Err(ApiError::bad_request(format!(
@@ -122,15 +141,23 @@ pub async fn vllm_load(
     let loaded = tokio::task::spawn_blocking({
         let name = name.clone();
         move || {
-            if req.load_inplace && engine.lora_id(&name).is_some() {
-                engine.unload_lora(&name)?;
+            // A replacement is read and validated before the adapter it
+            // replaces is let go, so a bad file leaves that one in place.
+            if replace {
+                engine.replace_lora(&name, &path)
+            } else {
+                engine.load_lora(&path, Some(&name), 0.0)
             }
-            engine.load_lora(&path, Some(&name), 0.0)
         }
     })
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?;
-    loaded.map_err(ApiError::from)?;
+    // A file that is not a usable adapter is the request's fault (vLLM's
+    // 400), not the server's.
+    loaded.map_err(|e| match e {
+        crate::JoshuaError::ModelLoad(msg) => ApiError::bad_request(msg),
+        e => ApiError::from(e),
+    })?;
     Ok(format!("Success: LoRA adapter '{name}' added successfully."))
 }
 
