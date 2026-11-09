@@ -47,13 +47,15 @@ about these routes.
 | `GET /health` (`/v1/health`) | ✅ |
 | `POST /chat/completions` | ✅ the OpenAI chat route without `/v1` |
 | `GET /metrics` | ✅ Prometheus text (joshua's own counter names; JSON at `/metrics/json`) |
-| `POST /completion` (`/completions`) | ✅ raw prompt: a string, token ids, a mix of both, or an array of those (an array of results); SSE streaming without `[DONE]`; `json_schema` / `response_format`; `return_tokens`; `n_probs` (`completion_probabilities` with `logprob` and `top_logprobs`); llama-server's result fields (`stop_type`, `stopping_word`, `tokens_cached`, `timings`, `generation_settings`). `grammar` (GBNF), `post_sampling_probs`, per-request `lora` and multimodal prompts are refused |
+| `POST /completion` (`/completions`) | ✅ raw prompt: a string, token ids, a mix of both, or an array of those (an array of results); SSE streaming without `[DONE]`; `json_schema` / `response_format`; `return_tokens`; `n_probs` (`completion_probabilities` with `logprob` and `top_logprobs`); llama-server's result fields (`stop_type`, `stopping_word`, `tokens_cached`, `timings`, `generation_settings`). per-request `lora` (`[{"id", "scale"}]`, unlisted adapters at 0). `grammar` (GBNF), `post_sampling_probs` and multimodal prompts are refused |
 | `POST /infill` | ✅ `input_prefix`, `input_suffix`, `input_extra`, `prompt`, in the model's FIM format (refused for a model without FIM tokens) |
 | `POST /embedding` (`/embeddings`) | ✅ `content` or `input`; `[{"index", "embedding": [[…]]}]`, one pooled L2-normalized vector per input (`embd_normalize` other than 2 is refused) |
 | `POST /rerank` (`/reranking`, `/v1/rerank`, `/v1/reranking`) | ✅ `query`, `documents` (or `texts`), `top_n`, with a generative reranker such as Qwen3-Reranker (see vLLM below); a model without `yes` and `no` tokens is refused |
 | `POST /apply-template` | ✅ the rendered chat prompt, `{"prompt": …}` |
 | `GET /props` | ✅ the model's real chat template, `default_generation_settings.params` under llama-server's names, `total_slots`, `build_info` |
 | `GET /slots` | ✅ one record per loaded model |
+| `GET /lora-adapters` | ✅ `[{"id", "path", "scale", "task_name", "prompt_prefix"}]` for the adapters loaded with `--lora` / `--lora-scaled` (`?model=` picks a model other than the default) |
+| `POST /lora-adapters` | ✅ `[{"id", "scale"}]` sets the server-wide scales; adapters left out go to 0 |
 | `POST /tokenize` | ✅ `with_pieces` (a piece is text, or its bytes when not whole UTF-8); `add_special` / `add_special_tokens`; `/api/tokens` too |
 | `POST /detokenize` | ✅ answers with `content` (llama.cpp's key) and `prompt` (vLLM's) |
 
@@ -80,7 +82,7 @@ bulk of it.  Of vLLM's own additions:
 | `POST /v1/score`, `/score` | ✅ with a generative reranker (Qwen3-Reranker and its fine-tunes): `text_1` against each `text_2`, or pair by pair; `instruction`. Cross-encoder and late-interaction score models are not supported |
 | `POST /v1/rerank`, `/rerank`, `/v2/rerank` | ✅ with a generative reranker: `query`, `documents` (strings or `{"text"}`), `top_n`, `return_documents`, `instruction`; results sorted by `relevance_score` |
 | `/classify`, `/pooling` | ❌ **by design** — they are for pooling models with a classification or pooling head, which joshua does not run |
-| `/v1/load_lora_adapter`, `/v1/unload_lora_adapter` | ❌ no LoRA adapter runtime |
+| `/v1/load_lora_adapter`, `/v1/unload_lora_adapter` | ❌ not yet: adapters load at startup (`--lora`) and run per request through llama-server's `lora` list, which the OpenAI routes accept too |
 | `/v1/responses` | ✅ see OpenAI above |
 | `/v1/chat/completions/batch` | ❌ not implemented |
 
@@ -204,3 +206,20 @@ The last row is the real gap. The endpoints look right, but no test drives them
 with an actual client binary, so field-level differences (a required key a
 client reads, an error shape, a streaming-term detail) are unverified. That is
 the next piece of work if "drop-in" is to mean more than "the route exists".
+
+## LoRA adapters
+
+`--lora FNAME` (scale 1) and `--lora-scaled FNAME SCALE` load GGUF LoRA
+adapters, as llama.cpp's `convert_lora_to_gguf.py` writes them, for the
+startup model; `--lora-init-without-apply` loads them at scale 0.  Each is
+validated against the model's projections when it loads, and refused when it
+targets one the loader cannot add a delta to.  Adapters run on the native
+loaders (Qwen and its relatives); other architectures refuse them.  Ids
+follow the order given and are never reused.
+
+A request runs the server-wide scales unless it sends its own `lora` list
+(on `/completion`, `/infill`, `/v1/completions` and `/v1/chat/completions`).
+The selection is part of the request's cache namespace: pooled sessions,
+prefix-cache entries and snapshots computed under one set of adapters and
+scales are only continued under the same set.  Requests with images (which
+run on the NPU plugin) refuse adapters.

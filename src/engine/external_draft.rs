@@ -127,12 +127,17 @@ impl Engine {
             Duration::ZERO,
             None,
         )?;
-        let (mut model, reused) = self.acquire_session(prompt, false, options.cache_namespace())?;
+        let options = self.clamp_options(options, Some(prompt.len()))?;
+        let (mut model, reused) = self.acquire_session(
+            prompt,
+            false,
+            options.cache_namespace(),
+            options.adapters.as_ref(),
+        )?;
         if !model.supports_speculative() {
             return Err(invalid("model lacks all-position logits and safe rollback"));
         }
         let logits = self.prefill(&mut model, &prompt[reused..], reused)?;
-        let options = self.clamp_options(options, Some(prompt.len()));
         let seed = options.seed.unwrap_or_else(rand::random);
         let sampler = SamplingWorkspace {
             controls: self.logit_controls(&options, seed, prompt, context),

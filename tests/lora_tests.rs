@@ -954,3 +954,195 @@ fn adapters_are_refused_where_they_cannot_apply() {
     assert_eq!(m.adapter_key(), None);
     std::fs::remove_dir_all(dir).ok();
 }
+
+/// The engine's registry: an adapter loaded by path runs at its server-wide
+/// scale, a request's own `lora` list overrides that, and pooled state
+/// computed under one selection is never continued under another.
+#[test]
+fn engine_runs_registered_adapters_per_request() {
+    use joshua::types::{GenerationOptions, LoraScale};
+    use joshua::{Engine, RawPrompt};
+
+    let path = fixture("engine", "qwen3", |p| common::write_tiny_qwen_gguf(p, "qwen3"));
+    let table = load(&path).lora_slots().expect("the qwen loader applies LoRA");
+    let dir = path.parent().unwrap();
+    let file = write_adapter(dir, "style.gguf", &table, 0.0, &specs(&table, 2, 7, |_| true));
+    let engine = Engine::with_n_ctx(&path, 64).unwrap();
+
+    let run = |lora: Option<Vec<LoraScale>>| -> joshua::Result<Vec<(u32, f32)>> {
+        let options = GenerationOptions {
+            max_tokens: 4,
+            min_tokens: 4,
+            temperature: 0.0,
+            logprobs: Some(1),
+            lora,
+            ..Default::default()
+        };
+        let done = engine.complete_prompt(&RawPrompt::tokens(PROMPT.to_vec()), &options)?;
+        Ok(done.logprobs.iter().map(|l| (l.token, l.logprob)).collect())
+    };
+    let base = run(None).unwrap();
+    // No adapter has id 0 yet.
+    assert!(run(Some(vec![LoraScale { id: 0, scale: 1.0 }])).is_err());
+
+    let info = engine.load_lora(&file, None, 1.0).unwrap();
+    assert_eq!((info.id, info.name.as_str(), info.scale), (0, "style", 1.0));
+    assert!(engine.load_lora(&file, None, 1.0).is_err(), "a second `style`");
+
+    // Server-wide scale 1, the same through a request's own list, and the
+    // base model through an empty list.  Each runs after another selection
+    // left its session in the pool.
+    let adapted = run(None).unwrap();
+    assert_ne!(adapted, base, "the adapter moves the logits");
+    assert_eq!(run(Some(vec![])).unwrap(), base);
+    assert_eq!(run(Some(vec![LoraScale { id: 0, scale: 1.0 }])).unwrap(), adapted);
+    assert_eq!(run(Some(vec![LoraScale { id: 0, scale: 0.0 }])).unwrap(), base);
+    let half = run(Some(vec![LoraScale { id: 0, scale: 0.5 }])).unwrap();
+    assert!(half != base && half != adapted);
+    assert_eq!(run(None).unwrap(), adapted);
+
+    // Bad lists are refused.
+    for bad in [
+        vec![LoraScale { id: 1, scale: 1.0 }],
+        vec![LoraScale { id: 0, scale: f32::NAN }],
+        vec![LoraScale { id: 0, scale: 1.0 }, LoraScale { id: 0, scale: 0.5 }],
+    ] {
+        assert!(run(Some(bad.clone())).is_err(), "{bad:?}");
+    }
+
+    // POST /lora-adapters' semantics: unlisted adapters go to 0.
+    engine.set_lora_scales(&[LoraScale { id: 0, scale: 0.5 }]).unwrap();
+    assert_eq!(engine.lora_adapters()[0].scale, 0.5);
+    assert_eq!(run(None).unwrap(), half);
+    engine.set_lora_scales(&[]).unwrap();
+    assert_eq!(run(None).unwrap(), base);
+
+    // Alternating selections each pick their own state back up instead of
+    // clearing the other's: the selection is part of the cache namespace.
+    engine.set_lora_scales(&[LoraScale { id: 0, scale: 1.0 }]).unwrap();
+    let cached = |lora: Option<Vec<LoraScale>>| {
+        let options = GenerationOptions { max_tokens: 2, temperature: 0.0, lora, ..Default::default() };
+        engine
+            .complete_prompt(&RawPrompt::tokens(PROMPT.to_vec()), &options)
+            .unwrap()
+            .cached_tokens
+    };
+    for _ in 0..2 {
+        cached(None);
+        cached(Some(vec![]));
+    }
+    assert!(cached(None) > 0, "the adapter's state was kept");
+    assert!(cached(Some(vec![])) > 0, "the base model's state was kept");
+
+    // Unloaded, it is gone; ids are never reused.  The idle sessions that
+    // ran it go back to the base model, so they no longer hold its weights,
+    // while the base model's own state is kept.
+    assert!(engine.pooled_adapter_sessions() > 0);
+    engine.unload_lora("style").unwrap();
+    assert!(engine.lora_adapters().is_empty());
+    assert_eq!(engine.pooled_adapter_sessions(), 0);
+    assert!(cached(Some(vec![])) > 0, "the base model's state survived the unload");
+    assert!(run(Some(vec![LoraScale { id: 0, scale: 1.0 }])).is_err());
+    let again = engine.load_lora(&file, Some("again"), 1.0).unwrap();
+    assert_eq!(again.id, 1);
+    assert_eq!(run(None).unwrap(), adapted);
+
+    // No more adapters can be active server-wide than one set can hold:
+    // such a selection would fail every request without its own list.
+    for i in 0..15 {
+        engine.load_lora(&file, Some(&format!("more{i}")), 1.0).unwrap();
+    }
+    assert!(engine.load_lora(&file, Some("one_too_many"), 1.0).is_err());
+    let idle = engine.load_lora(&file, Some("idle"), 0.0).unwrap();
+    let all: Vec<LoraScale> = engine
+        .lora_adapters()
+        .iter()
+        .map(|a| LoraScale { id: a.id, scale: 1.0 })
+        .collect();
+    assert_eq!(all.len(), 17);
+    assert!(engine.set_lora_scales(&all).is_err());
+    assert_eq!(engine.lora_adapters().last().unwrap().scale, 0.0, "a refused update changes nothing");
+    engine.set_lora_scales(&[LoraScale { id: idle.id, scale: 1.0 }]).unwrap();
+}
+
+/// llama-server's LoRA routes over the registry, and a request's `lora`
+/// list on `/completion` and `/v1/chat/completions`.
+#[tokio::test]
+async fn lora_adapters_routes_list_and_set_scales() {
+    use axum::body::Body;
+    use axum::http::{header, Request, StatusCode};
+    use joshua::server::{create_router, ServerState};
+    use serde_json::{json, Value};
+    use tower::ServiceExt;
+
+    let path = fixture("routes", "qwen3", |p| common::write_tiny_qwen_gguf(p, "qwen3"));
+    let table = load(&path).lora_slots().expect("the qwen loader applies LoRA");
+    let file = write_adapter(path.parent().unwrap(), "style.gguf", &table, 0.0, &specs(&table, 2, 7, |_| true));
+    let engine = joshua::Engine::with_n_ctx(&path, 64).unwrap();
+    engine.load_lora(&file, None, 0.0).unwrap();
+    let app = create_router(Arc::new(ServerState::new(Arc::new(engine))));
+    let call = |method: &str, uri: &str, body: Value| {
+        let req = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(if method == "GET" { Body::empty() } else { Body::from(body.to_string()) })
+            .unwrap();
+        let app = app.clone();
+        async move {
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+            (status, serde_json::from_slice::<Value>(&bytes).unwrap_or_default())
+        }
+    };
+
+    let (status, list) = call("GET", "/lora-adapters", Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{list}");
+    assert_eq!(list[0]["id"], 0, "{list}");
+    assert_eq!(list[0]["scale"], 0.0, "{list}");
+    assert!(list[0]["path"].as_str().unwrap().ends_with("style.gguf"), "{list}");
+
+    let completion = |lora: Option<Value>| {
+        let mut body = json!({"prompt": [1, 4, 2, 7], "n_predict": 3, "temperature": 0, "n_probs": 1});
+        if let Some(lora) = lora {
+            body["lora"] = lora;
+        }
+        call("POST", "/completion", body)
+    };
+    let (status, base) = completion(None).await;
+    assert_eq!(status, StatusCode::OK, "{base}");
+    let (status, adapted) = completion(Some(json!([{"id": 0, "scale": 1.0}]))).await;
+    assert_eq!(status, StatusCode::OK, "{adapted}");
+    assert_ne!(base["completion_probabilities"], adapted["completion_probabilities"]);
+
+    // The server-wide scale, set over the API, is what a request without
+    // its own list runs.
+    let (status, ok) = call("POST", "/lora-adapters", json!([{"id": 0, "scale": 1.0}])).await;
+    assert_eq!((status, &ok), (StatusCode::OK, &json!({"success": true})));
+    let (_, list) = call("GET", "/lora-adapters", Value::Null).await;
+    assert_eq!(list[0]["scale"], 1.0, "{list}");
+    let (_, again) = completion(None).await;
+    assert_eq!(again["completion_probabilities"], adapted["completion_probabilities"]);
+
+    // The OpenAI routes take the same list.
+    let chat = |lora: Value| {
+        call(
+            "POST",
+            "/v1/chat/completions",
+            json!({"model": "", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 3,
+                   "temperature": 0, "logprobs": true, "lora": lora}),
+        )
+    };
+    let (status, on) = chat(json!([{"id": 0, "scale": 1.0}])).await;
+    assert_eq!(status, StatusCode::OK, "{on}");
+    let (status, off) = chat(json!([])).await;
+    assert_eq!(status, StatusCode::OK, "{off}");
+    assert_ne!(on["choices"][0]["logprobs"], off["choices"][0]["logprobs"]);
+
+    // An id no adapter has is a 400, before anything runs.
+    let (status, err) = completion(Some(json!([{"id": 9, "scale": 1.0}]))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+    let (status, err) = call("POST", "/lora-adapters", json!([{"id": 9, "scale": 1.0}])).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+}

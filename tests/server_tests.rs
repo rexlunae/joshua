@@ -1709,7 +1709,7 @@ async fn llama_server_native_routes_answer_in_llama_server_shapes() {
         (serde_json::json!({"grammar": "root ::= \"a\""}), "grammar"),
         (
             serde_json::json!({"lora": [{"id": 0, "scale": 1.0}]}),
-            "lora",
+            "no LoRA adapter has id 0",
         ),
         (
             serde_json::json!({"prompt": {"prompt_string": "a"}}),

@@ -50,6 +50,8 @@ pub mod kv_int8;
 pub mod kimi_k3;
 pub mod low_bit;
 pub mod lora;
+pub mod lora_registry;
+pub mod lora_api;
 pub mod mapping;
 pub mod megakernel;
 pub mod mmap_tensor;

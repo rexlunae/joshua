@@ -1159,6 +1159,11 @@ impl QuantizedModel {
         session!(self, m => m.adapter_key(), _ => None)
     }
 
+    /// The LoRA adapter set this session runs (`None`: the base model).
+    pub fn adapters(&self) -> Option<std::sync::Arc<crate::lora::ActiveSet>> {
+        session!(self, m => m.adapters().cloned(), _ => None)
+    }
+
     /// Up to `n` MTP drafts after `next`, the token about to be fed at `pos`
     /// (see [`crate::native_session::Session::mtp_draft`]); empty when MTP is
     /// off.

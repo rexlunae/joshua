@@ -867,6 +867,11 @@ impl<W: LayerStack> Session<W> {
         self.lora.as_ref().map(|s| s.key())
     }
 
+    /// The LoRA adapter set this session runs (`None`: the base model).
+    pub fn adapters(&self) -> Option<&Arc<ActiveSet>> {
+        self.lora.as_ref()
+    }
+
     /// Draft up to `n` tokens after `next`, the token about to be fed at
     /// `pos`, with the MTP block: the row `(next, h_{pos-1})` predicts the
     /// first draft, and each further row chains the block's own output as

@@ -5,8 +5,9 @@
 //! The prompt forms, infill prompt, options and runners are
 //! [`crate::completions`]'s; this module reads llama-server's request fields
 //! and frames llama-server's answers.  A request that asks for something
-//! the engine does not do (`grammar`, `n_probs`, `lora`, multimodal
-//! prompts) is refused rather than ignored.
+//! the engine does not do (`grammar`, multimodal prompts) is refused rather
+//! than ignored.  A request's `lora` scales and `GET`/`POST /lora-adapters`
+//! run the adapters [`crate::lora_registry`] holds.
 
 use std::sync::Arc;
 
@@ -63,8 +64,6 @@ struct LlamaRequest {
     json_schema: Option<Value>,
     #[serde(default)]
     response_format: Option<Value>,
-    #[serde(default)]
-    lora: Option<Vec<Value>>,
     // `/infill`'s.
     #[serde(default)]
     input_prefix: Option<String>,
@@ -90,9 +89,6 @@ impl LlamaRequest {
             return Err(ApiError::bad_request(
                 "`grammar` (GBNF) is not supported; use `json_schema`",
             ));
-        }
-        if req.lora.as_ref().is_some_and(|l| !l.is_empty()) {
-            return Err(ApiError::bad_request("per-request `lora` is not supported"));
         }
         Ok(req)
     }
@@ -528,7 +524,6 @@ mod tests {
         assert!(request(json!({"n_probs": 21})).is_err());
         assert!(request(json!({"n_probs": 3, "post_sampling_probs": true})).is_err());
         assert!(request(json!({"grammar": "root ::= \"a\""})).is_err());
-        assert!(request(json!({"lora": [{"id": 0, "scale": 1.0}]})).is_err());
         assert!(request(json!({"n_probs": 0, "grammar": "", "lora": []})).is_ok());
     }
 

@@ -1260,6 +1260,18 @@ pub fn create_router(state: AppState) -> Router {
         // Ollama's clients read `{"error": "<message>"}`, for every error
         // these routes give (a key refused above them included).
         .layer(middleware::from_fn(crate::ollama::error_shape));
+    // Setting the server-wide LoRA scales changes what every other client's
+    // requests run, so it stays same-origin like model management (but
+    // keeps llama-server's error shape).
+    let lora = Router::new()
+        .route(
+            "/lora-adapters",
+            get(crate::lora_api::list).post(crate::lora_api::set),
+        )
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            require_api_key,
+        ));
     let cors = cors_layer(&state.cors_origins);
     Router::new()
         .route("/health", get(health))
@@ -1272,6 +1284,7 @@ pub fn create_router(state: AppState) -> Router {
         .merge(api)
         .layer(cors)
         .merge(manage)
+        .merge(lora)
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             count_requests,

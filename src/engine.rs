@@ -1043,6 +1043,12 @@ pub struct Engine {
     /// accelerator, one upload — of the model.  `None` until the first load,
     /// and always for architectures whose instances own their weights.
     weights_template: Mutex<Option<QuantizedModel>>,
+    /// The LoRA adapters loaded for this model (see [`crate::lora_registry`]).
+    lora: crate::lora_registry::Registry,
+    /// The projections LoRA adapters are validated against, read from the
+    /// first model instance that needs them; `None` inside for a loader that
+    /// applies no adapters.
+    lora_slots: std::sync::OnceLock<Option<crate::lora::SlotTable>>,
     /// Cap on idle sessions kept warm for architectures whose sessions each
     /// carry a full copy of the weights on an accelerator, sized from the
     /// device's memory at load (see [`crate::placement::instances_for_memory`]).
@@ -1545,6 +1551,29 @@ impl GenSession {
                 }
             },
             Self::Npu(_) => false,
+        }
+    }
+
+    /// Run every later forward pass with `set`'s LoRA deltas, or the base
+    /// model for `None` (see [`QuantizedModel::set_adapters`]).  `Ok(true)`
+    /// when the set changed and the session's state was cleared.
+    fn set_adapters(&mut self, set: Option<Arc<crate::lora::ActiveSet>>) -> Result<bool> {
+        match (self, set) {
+            (Self::Candle(model), set) => model
+                .set_adapters(set)
+                .map_err(|e| JoshuaError::InvalidRequest(e.to_string())),
+            (Self::Npu(_), None) => Ok(false),
+            (Self::Npu(_), Some(_)) => Err(JoshuaError::InvalidRequest(
+                "LoRA adapters do not run on the NPU plugin".to_string(),
+            )),
+        }
+    }
+
+    /// The LoRA adapter set this session runs (`None`: the base model).
+    fn adapters(&self) -> Option<Arc<crate::lora::ActiveSet>> {
+        match self {
+            Self::Candle(model) => model.adapters(),
+            Self::Npu(_) => None,
         }
     }
 
@@ -3076,6 +3105,8 @@ impl Engine {
             dense_device,
             expert_device,
             weights_template: Mutex::new(None),
+            lora: Default::default(),
+            lora_slots: Default::default(),
             device_session_cap,
             remote_pool_cap: None,
             remote_capacity: None,
@@ -3595,7 +3626,7 @@ impl Engine {
             )));
         }
         let device = &self.dense_device;
-        let (session, _) = self.acquire_session(&[], false, None)?;
+        let (session, _) = self.acquire_session(&[], false, None, None)?;
         let mut session = Some(session);
         let all_positions = session
             .as_ref()
@@ -3717,6 +3748,7 @@ impl Engine {
         options
             .chat_template_kwargs
             .extend(crate::types::reasoning_template_kwargs(None, Some(false), None));
+        options.adapters = self.lora_set(&options)?;
         let scope = options.cache_namespace();
         let mut scores = Vec::with_capacity(pairs.len());
         let mut total_tokens: u32 = 0;
@@ -3741,7 +3773,8 @@ impl Engine {
             total_tokens = total_tokens.saturating_add(tokens.len() as u32);
             // The pool never reuses a whole prompt, so at least the last
             // token is fed and its logits come back.
-            let (mut session, n_reused) = self.acquire_session(&tokens, false, scope)?;
+            let (mut session, n_reused) =
+                self.acquire_session(&tokens, false, scope, options.adapters.as_ref())?;
             if n_reused > 0 {
                 session.checkpoint_prefix(n_reused);
             }
@@ -3783,6 +3816,7 @@ impl Engine {
         root: Option<usize>,
         top: u32,
         scope: Option<crate::affinity::Scope>,
+        adapters: Option<&Arc<crate::lora::ActiveSet>>,
     ) -> Result<Vec<crate::types::TokenLogprob>> {
         if self.arch_error.is_some() {
             return Err(JoshuaError::InvalidRequest(
@@ -3797,7 +3831,7 @@ impl Engine {
                 ..Default::default()
             })
             .collect();
-        let (mut session, _) = self.acquire_session(&[], false, scope)?;
+        let (mut session, _) = self.acquire_session(&[], false, scope, adapters)?;
         let all_positions = session.supports_speculative();
         let scored = score_window(
             &mut session,
@@ -4741,11 +4775,18 @@ impl Engine {
         // clamp only to the server ceiling. The prompt is checked against the
         // request's window once prefill reports its length, and the decode
         // loop's in-context guard bounds the total length.
-        let options = &self.clamp_options(options, None);
+        let options = &self.clamp_options(options, None)?;
+        if options.adapters.is_some() {
+            return Err(JoshuaError::InvalidRequest(
+                "LoRA adapters do not apply to requests with images, which run on the NPU \
+                 plugin"
+                    .to_string(),
+            ));
+        }
 
         // Acquire an NPU session (never by token prefix — the plugin owns
         // tokenisation here, so no history to match).
-        let (mut session, _) = self.acquire_session(&[], true, options.cache_namespace())?;
+        let (mut session, _) = self.acquire_session(&[], true, options.cache_namespace(), None)?;
         if !session.supports_media() {
             // Repool the (text-capable) session before failing.
             if session.clear_state() {
@@ -4936,7 +4977,9 @@ impl Engine {
         self.check_request_template(options)?;
         let n_ctx = self.request_n_ctx(options)?;
         self.prompt_keep(options, n_ctx)?;
-        self.check_token_controls(options)
+        self.check_token_controls(options)?;
+        // An unknown adapter id or a bad scale, before any stream starts.
+        self.lora_set(options).map(drop)
     }
 
     /// Refuse a request's own chat template unless the server trusts them
@@ -5010,12 +5053,15 @@ impl Engine {
     /// Clamp a request's generation length to the server's `max_output_tokens`
     /// ceiling and, when the prompt length is known, the remaining context
     /// window — so a client-supplied `max_tokens` can't force unbounded work.
+    /// Also resolves the request's LoRA selection into
+    /// [`GenerationOptions::adapters`].
     fn clamp_options(
         &self,
         options: &GenerationOptions,
         prompt_len: Option<usize>,
-    ) -> GenerationOptions {
+    ) -> Result<GenerationOptions> {
         let mut clamped = options.clone();
+        clamped.adapters = self.lora_set(options)?;
         let mut cap = clamped.max_tokens.min(self.max_output_tokens);
         if let Some(n_prompt) = prompt_len {
             let n_ctx = self.effective_n_ctx(options);
@@ -5023,7 +5069,7 @@ impl Engine {
             cap = cap.min(remaining);
         }
         clamped.max_tokens = cap;
-        clamped
+        Ok(clamped)
     }
 
     /// Shared completion path, from prompt text (tokenized here, with the
@@ -5099,7 +5145,7 @@ impl Engine {
 
         // Clamp the client-supplied generation length to the server ceiling
         // and the remaining context window.
-        let options = &self.clamp_options(options, Some(n_prompt));
+        let options = &self.clamp_options(options, Some(n_prompt))?;
 
         // ── Validate the structured-output constraint before any backend work ─
         // A malformed `response_format` (or a tokenizer that cannot support
@@ -5119,7 +5165,13 @@ impl Engine {
         let prompt_logprobs = match options.prompt_logprobs {
             Some(top) => {
                 let entries =
-                    self.score_prompt(prompt_tokens, root, top, options.cache_namespace())?;
+                    self.score_prompt(
+                        prompt_tokens,
+                        root,
+                        top,
+                        options.cache_namespace(),
+                        options.adapters.as_ref(),
+                    )?;
                 if let Some(sink) = &options.logprob_sink {
                     sink.set_prompt(entries.clone());
                 }
@@ -5133,7 +5185,12 @@ impl Engine {
         // Prefer a pooled instance whose state already covers a prefix of
         // this prompt; fall back to a reset instance or a fresh load.
         let (mut session, n_reused) =
-            self.acquire_session(prompt_tokens, allow_npu, options.cache_namespace())?;
+            self.acquire_session(
+                prompt_tokens,
+                allow_npu,
+                options.cache_namespace(),
+                options.adapters.as_ref(),
+            )?;
         let was_npu = session.is_npu();
 
         let streaming = on_text.is_some();
@@ -5188,7 +5245,12 @@ impl Engine {
                 }
                 tracing::warn!("Retrying request on the candle path after NPU failure: {e}");
                 let (mut session, n_reused) =
-                    self.acquire_session(prompt_tokens, false, options.cache_namespace())?;
+                    self.acquire_session(
+                        prompt_tokens,
+                        false,
+                        options.cache_namespace(),
+                        options.adapters.as_ref(),
+                    )?;
                 match self.run_generation(
                     &mut session,
                     prompt_tokens,
@@ -6468,13 +6530,37 @@ impl Engine {
     /// 3. a pooled instance whose state can be cleared — skips re-creating
     ///    the session;
     /// 4. a fresh session (NPU) or a fresh instance from the mmap (candle).
+    ///
+    /// The session runs `adapters` (see [`GenSession::set_adapters`]); a
+    /// request with adapters never runs on the NPU.  `scope` must be the
+    /// request's [`GenerationOptions::cache_namespace`], which names the
+    /// adapter set, so reused state was computed under the same one.
     fn acquire_session(
         &self,
         prompt_tokens: &[u32],
         allow_npu: bool,
         scope: Option<crate::affinity::Scope>,
+        adapters: Option<&Arc<crate::lora::ActiveSet>>,
     ) -> Result<(GenSession, usize)> {
-        let want_npu = allow_npu && self.npu.as_ref().is_some_and(|n| n.usable());
+        let (mut session, reused) =
+            self.acquire_session_inner(prompt_tokens, allow_npu, scope, adapters)?;
+        // Pooled and cached state comes from this scope, so the set is
+        // already the session's and nothing is cleared; a session cleared
+        // here (state from elsewhere) is reused from its start.
+        let cleared = session.set_adapters(adapters.cloned())?;
+        Ok((session, if cleared { 0 } else { reused }))
+    }
+
+    fn acquire_session_inner(
+        &self,
+        prompt_tokens: &[u32],
+        allow_npu: bool,
+        scope: Option<crate::affinity::Scope>,
+        adapters: Option<&Arc<crate::lora::ActiveSet>>,
+    ) -> Result<(GenSession, usize)> {
+        let want_npu = allow_npu
+            && adapters.is_none()
+            && self.npu.as_ref().is_some_and(|n| n.usable());
 
         // Edited-context candidate, if any: picked under the pool lock, but
         // rewound (a potentially large KV copy) outside the critical section
@@ -6600,7 +6686,7 @@ impl Engine {
         }
 
         if from_cache {
-            if let Some(resumed) = self.resume_from_prefix_cache(prompt_tokens, scope)? {
+            if let Some(resumed) = self.resume_from_prefix_cache(prompt_tokens, scope, adapters)? {
                 return Ok(resumed);
             }
         }
@@ -6663,6 +6749,99 @@ impl Engine {
         }
 
         Ok((GenSession::Candle(Box::new(self.load_model()?)), 0))
+    }
+
+    // ─── LoRA adapters ────────────────────────────────────────────────────────
+
+    /// The projections adapters are validated against, read once from a
+    /// model instance (which then joins the pool); `None` for a loader that
+    /// applies no adapters.
+    fn lora_table(&self) -> Result<Option<crate::lora::SlotTable>> {
+        if let Some(table) = self.lora_slots.get() {
+            return Ok(table.clone());
+        }
+        let model = self.load_model()?;
+        let table = model.lora_slots();
+        self.release_model(GenSession::Candle(Box::new(model)), Vec::new(), None);
+        Ok(self.lora_slots.get_or_init(|| table).clone())
+    }
+
+    /// Load the LoRA adapter at `path` under `name` (its file stem by
+    /// default) at server-wide scale `scale` (see [`crate::lora_registry`]).
+    pub fn load_lora(
+        &self,
+        path: &Path,
+        name: Option<&str>,
+        scale: f32,
+    ) -> Result<crate::lora_registry::LoraInfo> {
+        let table = self.lora_table()?.ok_or_else(|| {
+            JoshuaError::InvalidRequest(
+                "LoRA adapters are not supported for this model's architecture".to_string(),
+            )
+        })?;
+        let info = self.lora.load(path, name, scale, &table)?;
+        tracing::info!(id = info.id, name = %info.name, path = %path.display(), scale, "loaded a LoRA adapter");
+        Ok(info)
+    }
+
+    /// Unload the LoRA adapter named `name`.  Idle pooled sessions running
+    /// it go back to the base model (their state is cleared), so the
+    /// adapter's weights are freed once the requests running it finish;
+    /// those return their sessions through [`Self::release_model`], which
+    /// detaches them the same way.
+    pub fn unload_lora(&self, name: &str) -> Result<crate::lora_registry::LoraInfo> {
+        let info = self.lora.unload(name)?;
+        for cached in self.model_pool().iter_mut() {
+            self.detach_unloaded_adapters(&mut cached.session, &mut cached.tokens);
+        }
+        Ok(info)
+    }
+
+    /// How many idle pooled sessions run a LoRA adapter set (for tests).
+    #[doc(hidden)]
+    pub fn pooled_adapter_sessions(&self) -> usize {
+        self.model_pool()
+            .iter()
+            .filter(|c| c.session.adapters().is_some())
+            .count()
+    }
+
+    /// Put `session` back on the base model, with its state and `tokens`
+    /// cleared, when it runs an adapter that is no longer loaded.
+    fn detach_unloaded_adapters(&self, session: &mut GenSession, tokens: &mut Vec<u32>) {
+        let Some(set) = session.adapters() else {
+            return;
+        };
+        if self.lora.holds(&set) {
+            return;
+        }
+        drop(set);
+        match session.set_adapters(None) {
+            Ok(_) => tokens.clear(),
+            Err(e) => tracing::warn!(error = %e, "could not detach an unloaded LoRA adapter"),
+        }
+    }
+
+    /// The loaded LoRA adapters, by id.
+    pub fn lora_adapters(&self) -> Vec<crate::lora_registry::LoraInfo> {
+        self.lora.list()
+    }
+
+    /// The id of the LoRA adapter named `name`.
+    pub fn lora_id(&self, name: &str) -> Option<usize> {
+        self.lora.id_of(name)
+    }
+
+    /// Set the server-wide LoRA scales: the listed adapters' to theirs and
+    /// every other one's to 0.
+    pub fn set_lora_scales(&self, scales: &[crate::types::LoraScale]) -> Result<()> {
+        self.lora.set_scales(scales)
+    }
+
+    /// The adapter set `options` runs (its own `lora` scales or the
+    /// server-wide ones), or `None` for the base model.
+    fn lora_set(&self, options: &GenerationOptions) -> Result<Option<Arc<crate::lora::ActiveSet>>> {
+        self.lora.select(options.lora.as_deref())
     }
 
     // ─── Prefix cache ─────────────────────────────────────────────────────────
@@ -6834,6 +7013,7 @@ impl Engine {
         &self,
         prompt_tokens: &[u32],
         scope: Option<crate::affinity::Scope>,
+        adapters: Option<&Arc<crate::lora::ActiveSet>>,
     ) -> Result<Option<(GenSession, usize)>> {
         let hit = {
             let mut cache = self.prefix_cache();
@@ -6849,6 +7029,9 @@ impl Engine {
             return Ok(None);
         };
         let mut session = GenSession::Candle(Box::new(self.load_model()?));
+        // A snapshot restores only into a session running the adapter set
+        // it was computed under.
+        session.set_adapters(adapters.cloned())?;
         if !session.restore(hit.snap) {
             return Ok(None);
         }
@@ -6880,6 +7063,9 @@ impl Engine {
         tokens: Vec<u32>,
         scope: Option<crate::affinity::Scope>,
     ) {
+        let mut session = session;
+        let mut tokens = tokens;
+        self.detach_unloaded_adapters(&mut session, &mut tokens);
         let mut pool = self.model_pool();
         pool.push(CachedModel {
             session,
