@@ -2813,3 +2813,43 @@ async fn ollama_generate_fills_in_the_middle() {
     assert_eq!(reply["prompt_eval_count"], 5, "{body}");
     assert!(reply.get("context").is_none(), "{body}");
 }
+
+/// A conversation continued from its `context` closes the earlier answer
+/// as the chat template closes an answer ("hello" here) before the new
+/// turn.
+#[tokio::test]
+async fn ollama_context_closes_the_earlier_answer() {
+    let dir = model_dir("ollama-context-turns");
+    let model = dir.join("model.gguf");
+    write_tiny_llama_gguf(&model);
+    common::replace_chat_template(
+        &model,
+        "{% for m in messages %}{{ m.content }} hello {% endfor %}\
+         {% if add_generation_prompt %}world{% endif %}",
+    );
+    let engine = Engine::with_n_ctx(&dir, 512).expect("engine should load tiny model");
+    let app = create_router(Arc::new(ServerState::new(Arc::new(engine))));
+    let generate = |extra: serde_json::Value| {
+        let mut body = serde_json::json!({
+            "model": "model", "prompt": "a b", "stream": false,
+            "options": {"num_predict": 2, "temperature": 0},
+        });
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let app = app.clone();
+        async move {
+            let (status, body) = call(&app, "POST", "/api/generate", Some(body)).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let reply: serde_json::Value = serde_json::from_str(&body).unwrap();
+            reply["context"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t.as_u64().unwrap())
+                .collect::<Vec<u64>>()
+        }
+    };
+    let first = generate(serde_json::json!({})).await;
+    let next = generate(serde_json::json!({"prompt": "c", "context": first})).await;
+    // hello (closing the answer), c, hello, world, then the new answer.
+    assert_eq!(&next[first.len()..first.len() + 4], &[1, 6, 1, 2], "{next:?}");
+}
