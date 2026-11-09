@@ -1,2 +1,5 @@
 /target
 Cargo.lock
+clients/python/.venv/
+clients/node/node_modules/
+__pycache__/

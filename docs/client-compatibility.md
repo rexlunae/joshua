@@ -1,11 +1,14 @@
 # Client compatibility matrix
 
-What joshua's HTTP server supports for each client ecosystem, verified against
-the routes registered in `src/server.rs` and `src/ollama.rs` on `main`.
+What joshua's HTTP server supports for each client ecosystem, per the routes
+registered in `src/server.rs` and `src/ollama.rs` on `main`.  A ✅ means the
+route is wired to the engine with the parameters listed; anything it refuses is
+named in the row.
 
-In every row the answer is **"verified in code"** (the route exists and is
-wired to the engine) or a stated reason it does not.  Behavioural parity with a
-real client binary is *not* covered by the test suite today — see
+The OpenAI and Ollama routes are also driven on every CI run by the client
+libraries people actually use, `openai` and `ollama` for Python and Node,
+against a live server (`scripts/client-tests.sh`, see `clients/`).  What that
+covers, and what still needs a manual run, is under
 [Verification status](#verification-status).
 
 ---
@@ -202,12 +205,14 @@ Ollama's `:tag` names a manifest, which has no joshua equivalent.
 |---|---|
 | Route exists and is wired | ✅ by inspection + the inline unit tests |
 | Translation layer (Ollama option mapping, name tagging, path confinement) | ✅ unit tests in `src/ollama.rs` |
-| **A real `ollama` / `llama-server` / vLLM client against the server** | ❌ **not tested** |
+| `openai` Python SDK (also what vLLM clients use) | ✅ CI: models, chat (plain, streamed with usage, tools, logprobs), vLLM `extra_body` sampling, completions, embeddings (float and base64), responses, a 400 error |
+| `ollama` Python library | ✅ CI: version, list/show, chat (plain, streamed, `format: json`), generate with `context`, embed, ps, copy/delete |
+| `openai` and `ollama` Node libraries | ✅ CI: the same core calls, including openai-node's default base64 embeddings |
+| The `ollama` CLI, Open WebUI, a LAN client | ❌ manual only; not yet run |
 
-The last row is the real gap. The endpoints look right, but no test drives them
-with an actual client binary, so field-level differences (a required key a
-client reads, an error shape, a streaming-term detail) are unverified. That is
-the next piece of work if "drop-in" is to mean more than "the route exists".
+The CI model is tiny with random weights, so these runs check protocol shapes
+(fields, streaming framing, status codes), not the quality of answers.  The
+`llama-server` routes and the Anthropic route have no client-library run yet.
 
 ## LoRA adapters
 
