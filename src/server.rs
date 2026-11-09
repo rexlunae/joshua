@@ -268,7 +268,50 @@ impl ServerState {
                     .filter(|model| model.facts.as_ref().is_none_or(GgufFacts::is_model)),
             );
         }
+        // Each LoRA adapter is a model of its own name whose `parent` is its
+        // base, as vLLM lists them: those loaded, then the adapter models
+        // Ollama's create made that are not.  A model's id wins over an
+        // adapter's name.
+        let mut adapters: Vec<ModelInfo> = loaded
+            .iter()
+            .flat_map(|m| {
+                let base = m.info();
+                m.engine.lora_adapters().into_iter().map(move |a| ModelInfo {
+                    id: a.name,
+                    path: Some(a.path),
+                    parent: Some(base.id.clone()),
+                    ..base.clone()
+                })
+            })
+            .collect();
+        if let Some(manager) = &self.manager {
+            for created in crate::ollama_pull::adapter_models(&manager.model_dir) {
+                if adapters.iter().any(|a| a.id == created.name) {
+                    continue;
+                }
+                let base = out
+                    .iter()
+                    .find(|m| m.id == created.base)
+                    .cloned()
+                    .unwrap_or_else(|| ModelInfo::new(created.base.clone(), 0));
+                adapters.push(ModelInfo {
+                    id: created.name,
+                    loaded: false,
+                    path: Some(created.path),
+                    parent: Some(created.base),
+                    ..base
+                });
+            }
+        }
+        adapters.retain(|a| !out.iter().any(|m| m.id == a.id));
+        out.extend(adapters);
         out
+    }
+
+    /// The adapter model Ollama's create made as `name` (see
+    /// [`crate::ollama_pull::AdapterModel`]), with a model directory.
+    pub(crate) fn adapter_model(&self, name: &str) -> Option<crate::ollama_pull::AdapterModel> {
+        crate::ollama_pull::adapter_model(&self.manager.as_ref()?.model_dir, name)
     }
 
     /// The model directory's files that are not loaded, under the ids the
@@ -1104,12 +1147,56 @@ pub(crate) async fn select_generation(
             });
         }
     }
+    if let Some(created) = state.adapter_model(name) {
+        if !names_a_model(state, name).await? {
+            return load_adapter_model(state, created).await;
+        }
+    }
     let (model, engine) = select_model(state, requested).await?;
     Ok(Selected {
         model,
         engine,
         adapter: None,
     })
+}
+
+/// Select an adapter model Ollama's create made: load its base (as a
+/// request naming the base would) and then its adapter, at server-wide
+/// scale 0 so it runs only for requests naming it.
+async fn load_adapter_model(
+    state: &AppState,
+    created: crate::ollama_pull::AdapterModel,
+) -> Result<Selected, ApiError> {
+    let (_, engine) = select_model(state, &created.base).await.map_err(|e| {
+        let status = e.into_response().status();
+        ApiError::new(
+            status,
+            format!("model '{}' runs on '{}', which cannot be loaded", created.name, created.base),
+            "model_not_found",
+        )
+    })?;
+    // Serialised with the runtime routes, so one name is loaded once.
+    let _serial = crate::lora_api::RUNTIME_LOADS.lock().await;
+    if let Some((engine, id)) = state.models.adapter(&created.name) {
+        return Ok(Selected { model: created.name, engine, adapter: Some(id) });
+    }
+    let loaded = tokio::task::spawn_blocking({
+        let engine = Arc::clone(&engine);
+        let (path, name) = (created.path.clone(), created.name.clone());
+        move || engine.load_lora(&path, Some(&name), 0.0)
+    })
+    .await
+    .map_err(|e| ApiError::internal(e.to_string()))?
+    .map_err(|e| match e {
+        crate::JoshuaError::ModelLoad(msg) | crate::JoshuaError::InvalidRequest(msg) => {
+            ApiError::bad_request(format!(
+                "model '{}': its adapter does not load on '{}': {msg}",
+                created.name, created.base
+            ))
+        }
+        e => ApiError::from(e),
+    })?;
+    Ok(Selected { model: created.name, engine, adapter: Some(loaded.id) })
 }
 
 /// Whether `name` is a model's id: a loaded model's, or that of a
@@ -1898,6 +1985,11 @@ async fn worker_info(State(state): State<AppState>) -> Result<Json<WorkerInfo>, 
         ));
     }
     let engines = || models.iter().map(|m| &m.engine);
+    let created = state
+        .manager
+        .as_ref()
+        .map(|manager| crate::ollama_pull::adapter_models(&manager.model_dir))
+        .unwrap_or_default();
     Ok(Json(WorkerInfo {
         transcription_job: state.whisper.as_ref().map(|whisper| JobModel {
             model: whisper.model_name().to_string(), owner: whisper.job_owner.clone(),
@@ -1944,11 +2036,19 @@ async fn worker_info(State(state): State<AppState>) -> Result<Json<WorkerInfo>, 
                         in_flight: m.engine.in_flight(),
                         embeddings,
                     };
+                    // Loaded adapters, and the adapter models Ollama's
+                    // create made on this model, which load on first use.
+                    let loaded: Vec<String> = m.engine.lora_adapters().into_iter().map(|a| a.name).collect();
+                    let created = created
+                        .iter()
+                        .filter(|c| c.base == m.id && !loaded.contains(&c.name))
+                        .map(|c| c.name.clone())
+                        .collect::<Vec<_>>();
                     std::iter::once(slots(m.id.clone(), m.engine.supports_embeddings(), None)).chain(
-                        m.engine
-                            .lora_adapters()
+                        loaded
                             .into_iter()
-                            .map(move |a| slots(a.name, false, Some(m.id.clone()))),
+                            .chain(created)
+                            .map(move |name| slots(name, false, Some(m.id.clone()))),
                     )
                 })
                 .collect(),
@@ -2039,25 +2139,9 @@ pub(crate) async fn embed_prompts(
 /// The `/v1/models` entries: [`ServerState::inventory`], then the Whisper
 /// model.
 async fn model_cards(state: AppState) -> Result<Vec<ModelCard>, ApiError> {
-    // vLLM lists each LoRA adapter as a model whose `parent` is its base.
-    let adapters: Vec<ModelInfo> = state
-        .models
-        .list()
-        .iter()
-        .flat_map(|m| {
-            let base = m.info();
-            m.engine.lora_adapters().into_iter().map(move |a| ModelInfo {
-                id: a.name,
-                path: Some(a.path),
-                parent: Some(base.id.clone()),
-                ..base.clone()
-            })
-        })
-        .collect();
     Ok(inventory(&state)
         .await?
         .into_iter()
-        .chain(adapters)
         .chain(state.whisper_info())
         .map(|model| model.card())
         .collect())

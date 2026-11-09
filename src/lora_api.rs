@@ -50,7 +50,7 @@ pub async fn set(
 }
 
 /// Serialises runtime adapter loads (see [`vllm_load`]).
-static RUNTIME_LOADS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static RUNTIME_LOADS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// vLLM's `POST /v1/load_lora_adapter` body.
 #[derive(Debug, Deserialize)]
@@ -113,6 +113,13 @@ pub async fn vllm_load(
     if crate::server::names_a_model(&state, &name).await? {
         return Err(ApiError::bad_request(format!(
             "'{name}' is a model's id; an adapter needs a name of its own"
+        )));
+    }
+    // An adapter model Ollama's create made owns its name too, loaded or
+    // not: a runtime adapter of that name would run in its place.
+    if state.adapter_model(&name).is_some() {
+        return Err(ApiError::bad_request(format!(
+            "'{name}' is an adapter model; an adapter needs a name of its own"
         )));
     }
     let replace = match state.models.adapter(&name) {

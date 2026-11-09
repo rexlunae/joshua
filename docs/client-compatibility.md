@@ -82,7 +82,7 @@ bulk of it.  Of vLLM's own additions:
 | `POST /v1/score`, `/score` | ✅ with a generative reranker (Qwen3-Reranker and its fine-tunes): `text_1` against each `text_2`, or pair by pair; `instruction`. Cross-encoder and late-interaction score models are not supported |
 | `POST /v1/rerank`, `/rerank`, `/v2/rerank` | ✅ with a generative reranker: `query`, `documents` (strings or `{"text"}`), `top_n`, `return_documents`, `instruction`; results sorted by `relevance_score` |
 | `/classify`, `/pooling` | ❌ **by design** — they are for pooling models with a classification or pooling head, which joshua does not run |
-| `/v1/load_lora_adapter`, `/v1/unload_lora_adapter` | ✅ with `--allow-runtime-lora` (vLLM's `VLLM_ALLOW_RUNTIME_LORA_UPDATING`): `{"lora_name", "lora_path", "load_inplace"}` and `{"lora_name"}`, answered with vLLM's `Success: ...` text; GGUF adapters only. Without the flag both are `404` |
+| `/v1/load_lora_adapter`, `/v1/unload_lora_adapter` | ✅ with `--allow-runtime-lora` (vLLM's `VLLM_ALLOW_RUNTIME_LORA_UPDATING`): `{"lora_name", "lora_path", "load_inplace"}` and `{"lora_name"}`, answered with vLLM's `Success: ...` text; GGUF or PEFT adapters. Without the flag both are `404` |
 | adapter-named models | ✅ `/v1/models` lists each loaded adapter with `parent` set to its base; naming one as `model` on `/v1/chat/completions`, `/v1/completions` or `/v1/responses` runs it at scale 1 |
 | `/v1/responses` | ✅ see OpenAI above |
 | `/v1/chat/completions/batch` | ❌ not implemented |
@@ -107,10 +107,11 @@ supported.
 | `POST /api/embed` | ✅ |
 | `POST /api/embeddings` | ✅ legacy shape: one `prompt` in, one `embedding` out |
 | `POST /api/tokens` | ✅ (joshua extension, mirrors `/tokenize`) |
-| `DELETE /api/delete` | ✅ removes `<name>.gguf` from the model directory |
+| `DELETE /api/delete` | ✅ removes `<name>.gguf` (or an adapter model `create` made) from the model directory |
 | `POST /api/copy` | ✅ |
 | `POST /api/create` (`from:`) | ✅ derives from an existing model |
 | `POST /api/create` (`files:`) | ✅ places one uploaded GGUF blob as `<model>.gguf`; Modelfile settings (`template`, `system`, `parameters`, `messages`, `adapters`, `quantize`) are refused |
+| `POST /api/create` (`from:` + `adapters:`) | ✅ a Modelfile's `FROM` + `ADAPTER`: one LoRA adapter (a GGUF, or a PEFT adapter's `adapter_model.safetensors` with `adapter_config.json`) kept as a model of its own name on the base — see [LoRA adapters](#lora-adapters). `adapters` with `files:` is refused: create the base first |
 | `HEAD`/`POST /api/blobs/{digest}` | ✅ uploads checked against their SHA-256, kept in `<model dir>/.blobs` |
 | `POST /api/pull` | ✅ from registry.ollama.ai, another registry speaking its protocol (`hf.co/...`), or an `https://` `.gguf` URL — see below |
 | `POST /api/push` | ❌ no registry |
@@ -258,3 +259,15 @@ that do not name them are unchanged.  The paths are read as given, so the
 flag is off by default; these routes, like `/lora-adapters` and model
 management, take the API key and send no CORS headers.  An unloaded adapter's
 weights are freed once the requests running it finish.
+
+Ollama's `create` with an `ADAPTER` line (`from` naming a model this server
+serves, and `adapters` naming one uploaded adapter) keeps the adapter in the
+model directory under `.adapters/<name>/`.  `<name>` is then a model like the
+others: `/api/tags` and `/v1/models` list it with its base as `parent`,
+`/api/show` gives `FROM <base>` and `ADAPTER <file>`, and a request naming
+it, on the Ollama routes or the OpenAI ones, loads its base and then its
+adapter (at server-wide scale 0, so the base's own requests are unchanged)
+and runs it at scale 1.  The adapter is checked against the base when it is
+first loaded.  `keep_alive: 0` lets the adapter go and keeps the base loaded;
+`/api/copy` and `/api/delete` act on it as on a model file, and it does not
+embed.  A model file of the same name wins over it.

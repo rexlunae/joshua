@@ -28,8 +28,8 @@ use sha2::{Digest, Sha256};
 use crate::lora::{invalid, LoraAdapter, LoraLimits, LoraPair, SlotTable};
 use crate::Result;
 
-const CONFIG: &str = "adapter_config.json";
-const WEIGHTS: &str = "adapter_model.safetensors";
+pub(crate) const CONFIG: &str = "adapter_config.json";
+pub(crate) const WEIGHTS: &str = "adapter_model.safetensors";
 
 /// A PEFT adapter's two files.
 #[derive(Debug, Clone)]
