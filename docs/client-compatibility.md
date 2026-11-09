@@ -50,6 +50,7 @@ about these routes.
 | `POST /completion` (`/completions`) | ✅ raw prompt: a string, token ids, a mix of both, or an array of those (an array of results); SSE streaming without `[DONE]`; `json_schema` / `response_format`; `return_tokens`; `n_probs` (`completion_probabilities` with `logprob` and `top_logprobs`); llama-server's result fields (`stop_type`, `stopping_word`, `tokens_cached`, `timings`, `generation_settings`). `grammar` (GBNF), `post_sampling_probs`, per-request `lora` and multimodal prompts are refused |
 | `POST /infill` | ✅ `input_prefix`, `input_suffix`, `input_extra`, `prompt`, in the model's FIM format (refused for a model without FIM tokens) |
 | `POST /embedding` (`/embeddings`) | ✅ `content` or `input`; `[{"index", "embedding": [[…]]}]`, one pooled L2-normalized vector per input (`embd_normalize` other than 2 is refused) |
+| `POST /rerank` (`/reranking`, `/v1/rerank`, `/v1/reranking`) | ✅ `query`, `documents` (or `texts`), `top_n`, with a generative reranker such as Qwen3-Reranker (see vLLM below); a model without `yes` and `no` tokens is refused |
 | `POST /apply-template` | ✅ the rendered chat prompt, `{"prompt": …}` |
 | `GET /props` | ✅ the model's real chat template, `default_generation_settings.params` under llama-server's names, `total_slots`, `build_info` |
 | `GET /slots` | ✅ one record per loaded model |
@@ -76,16 +77,18 @@ bulk of it.  Of vLLM's own additions:
 | `POST /v1/tokenize` | ✅ `prompt` or the chat form (`messages`, `tools`, `add_generation_prompt`); `return_token_strs`; `max_model_len` |
 | `POST /v1/detokenize` | ✅ |
 | `GET /v1/models` | ✅ |
-| `POST /v1/score`, `/score` | ❌ **by design** — vLLM's scoring API is for *score models* (cross-encoder, bi-encoder, late-interaction). joshua runs generative models; there is no scoring head to call. |
-| `/v1/rerank`, `/rerank`, `/v2/rerank` | ❌ same reason (pooling/rerank models) |
-| `/classify`, `/pooling` | ❌ same reason |
+| `POST /v1/score`, `/score` | ✅ with a generative reranker (Qwen3-Reranker and its fine-tunes): `text_1` against each `text_2`, or pair by pair; `instruction`. Cross-encoder and late-interaction score models are not supported |
+| `POST /v1/rerank`, `/rerank`, `/v2/rerank` | ✅ with a generative reranker: `query`, `documents` (strings or `{"text"}`), `top_n`, `return_documents`, `instruction`; results sorted by `relevance_score` |
+| `/classify`, `/pooling` | ❌ **by design** — they are for pooling models with a classification or pooling head, which joshua does not run |
 | `/v1/load_lora_adapter`, `/v1/unload_lora_adapter` | ❌ no LoRA adapter runtime |
 | `/v1/responses` | ✅ see OpenAI above |
 | `/v1/chat/completions/batch` | ❌ not implemented |
 
-**Honest summary:** vLLM *generative* serving is compatible; vLLM *pooling /
-scoring / rerank* serving is not, and adding it means running a different class
-of model, not adding a route.
+**Honest summary:** vLLM *generative* serving is compatible.  Scoring and
+reranking work with a *generative* reranker, which answers a yes/no
+relevance question (the score is the chance it says `yes`); cross-encoder
+rerankers with a classification head, and the pooling routes, are not
+supported.
 
 ## Ollama
 

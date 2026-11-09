@@ -70,6 +70,7 @@ pub mod quantized_qwen;
 pub mod quant_matmul;
 pub mod raw_block;
 pub mod reasoning;
+pub mod rerank;
 pub mod responses;
 pub mod cuda_io;
 pub mod residency;

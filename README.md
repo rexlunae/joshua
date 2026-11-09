@@ -391,7 +391,7 @@ registry:
 | OpenAI | `POST /v1/chat/completions`, `POST /v1/completions`, `POST /v1/responses` (with `GET`/`DELETE /v1/responses/{id}` and `/input_items`), `POST /v1/embeddings`, `POST /v1/audio/transcriptions`, `POST /v1/audio/translations`, `GET /v1/models` (also `/models`), `GET /v1/models/{id}` |
 | Anthropic | `POST /v1/messages`, `POST /v1/messages/count_tokens` |
 | llama.cpp (`llama-server`) | `GET /health` (also `/v1/health`), `GET /props`, `GET /slots`, `GET /metrics`, `POST /tokenize`, `POST /detokenize`, `POST /chat/completions` |
-| vLLM | `GET /load`, `GET /ping`, `GET /version`, `GET /metrics`, `POST /v1/tokenize`, `POST /v1/detokenize` |
+| vLLM | `GET /load`, `GET /ping`, `GET /version`, `GET /metrics`, `POST /v1/tokenize`, `POST /v1/detokenize`, `POST /v1/score`, `POST /v1/rerank` (also `/rerank`, `/v2/rerank` and llama-server's `/reranking`) |
 | Ollama | `HEAD /` heartbeat, `/api/chat`, `/api/generate`, `/api/embed` (and `/api/embeddings`), `/api/tags`, `/api/ps`, `/api/show`, `/api/version`, `/api/tokens`, and model management (`/api/delete`, `/api/copy`, `/api/create`) against the model directory |
 | joshua | `POST /v1/models/load`, `POST /v1/models/unload`, `GET /v1/worker/info`, `GET /status`, `GET /metrics/json` |
 
@@ -693,6 +693,30 @@ because vectors are always L2-normalized.
 > strategy from the GGUF metadata (mean / CLS / last-token).  Supported
 > architectures: `llama` (e5-mistral, SFR-Embedding), `qwen2` (gte-Qwen2),
 > and `qwen3` (Qwen3-Embedding).
+
+### `POST /v1/rerank` and `POST /v1/score`
+
+```bash
+curl http://localhost:8080/v1/rerank \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3-reranker","query":"What is the capital of France?",
+       "documents":["Paris is the capital of France.","Berlin is in Germany."],
+       "top_n":1}'
+```
+
+These run a *generative* reranker such as Qwen3-Reranker.  Each document is
+put to the model, through its chat template with thinking off, as a yes/no
+question: does it meet the query?  Its `relevance_score` is the chance the
+model answers `yes` rather than `no`.  `instruction` replaces the default
+task description ("Given a web search query, retrieve relevant passages
+that answer the query").  Results come back best first, cut to `top_n`,
+with each document's text unless `return_documents` is `false`.
+
+vLLM's `/v1/score` takes `text_1` and `text_2` and answers with the scores in
+input order: one `text_1` is scored against every `text_2`, and two lists of
+the same length are scored pair by pair.  A model whose vocabulary has no
+`yes` and `no` tokens is refused; cross-encoder rerankers with a
+classification head (bge-reranker, for example) are not supported.
 
 ### `POST /v1/audio/transcriptions`
 

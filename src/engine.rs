@@ -130,6 +130,13 @@ use crate::types::{
 
 pub mod external_draft;
 
+/// The system prompt a Qwen3-Reranker is trained to judge relevance under.
+const RERANK_JUDGE: &str = "Judge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".";
+
+/// Qwen3-Reranker's default instruction, for a request that gives none.
+pub const RERANK_INSTRUCTION: &str =
+    "Given a web search query, retrieve relevant passages that answer the query";
+
 // ─── Mmap configuration ─────────────────────────────────────────────────────
 
 /// Explicit huge-page size for [`HugePages::Explicit`].
@@ -3659,6 +3666,106 @@ impl Engine {
             self.release_model(session.expect("available session"), Vec::new(), None);
         }
         outcome.map(|_| acc)
+    }
+
+    /// Score how well each `(query, document)` pair matches, as a
+    /// generative reranker (Qwen3-Reranker and its fine-tunes) does: the
+    /// pair is put to the model as a yes/no judgement through its chat
+    /// template, with thinking turned off, and the score is the chance it
+    /// answers `yes` rather than `no`, `sigmoid(logit(yes) - logit(no))`.
+    ///
+    /// `instruction` says what counts as relevant; the reranker's own
+    /// default (web search) is used without one.  Pairs that share a
+    /// query share a prompt head, which the session pool's prefix reuse
+    /// reads once.  Returns the scores in `pairs` order and the number of
+    /// prompt tokens read.  A model whose vocabulary has no `yes` and `no`
+    /// tokens is refused, as is a set `cancel`.
+    pub fn rerank(
+        &self,
+        pairs: &[(&str, &str)],
+        instruction: Option<&str>,
+        options: &GenerationOptions,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(Vec<f32>, u32)> {
+        if self.remote_only() {
+            return Err(JoshuaError::InvalidRequest(
+                "reranking is not available for a model served by remote workers".into(),
+            ));
+        }
+        if self.arch_error.is_some() {
+            return Err(JoshuaError::InvalidRequest(
+                "reranking needs the CPU/GPU backend, which this model has none of".into(),
+            ));
+        }
+        let (Some(yes), Some(no)) = (
+            self.tokenizer.token_to_id("yes"),
+            self.tokenizer.token_to_id("no"),
+        ) else {
+            return Err(JoshuaError::InvalidRequest(
+                "this model cannot rerank: its vocabulary has no `yes` and `no` tokens".into(),
+            ));
+        };
+        let _permit = InFlightGuard::acquire_with(
+            &self.in_flight,
+            self.max_concurrency,
+            self.admission_queue_depth,
+            self.queue_timeout,
+            cancel,
+        )?;
+        let instruction = instruction.unwrap_or(RERANK_INSTRUCTION);
+        let mut options = options.clone();
+        options
+            .chat_template_kwargs
+            .extend(crate::types::reasoning_template_kwargs(None, Some(false), None));
+        let scope = options.cache_namespace();
+        let mut scores = Vec::with_capacity(pairs.len());
+        let mut total_tokens: u32 = 0;
+        for (query, document) in pairs {
+            if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
+                return Err(JoshuaError::Cancelled);
+            }
+            let messages = [
+                ChatMessage::text("system", RERANK_JUDGE),
+                ChatMessage::text(
+                    "user",
+                    format!("<Instruct>: {instruction}\n<Query>: {query}\n<Document>: {document}"),
+                ),
+            ];
+            let tokens = self.tokenize_chat(&messages, None, &options)?;
+            if tokens.is_empty() {
+                return Err(JoshuaError::InvalidRequest("a rerank prompt has no tokens".into()));
+            }
+            if tokens.len() >= self.n_ctx as usize {
+                return Err(JoshuaError::PromptTooLong(tokens.len(), self.n_ctx as usize));
+            }
+            total_tokens = total_tokens.saturating_add(tokens.len() as u32);
+            // The pool never reuses a whole prompt, so at least the last
+            // token is fed and its logits come back.
+            let (mut session, n_reused) = self.acquire_session(&tokens, false, scope)?;
+            if n_reused > 0 {
+                session.checkpoint_prefix(n_reused);
+            }
+            match self.prefill(&mut session, &tokens[n_reused..], n_reused) {
+                Ok(logits) => {
+                    self.release_model(session, tokens, scope);
+                    let (Some(&y), Some(&n)) =
+                        (logits.get(yes as usize), logits.get(no as usize))
+                    else {
+                        return Err(JoshuaError::Inference(
+                            "the model's logits do not cover its `yes`/`no` tokens".into(),
+                        ));
+                    };
+                    scores.push(1.0 / (1.0 + (n - y).exp()));
+                }
+                Err(e) => {
+                    if session.clear_state() {
+                        self.release_model(session, Vec::new(), scope);
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok((scores, total_tokens))
     }
 
     /// Each of `tokens`' log-probability given the tokens before it, with
@@ -11810,3 +11917,4 @@ mod tests {
         assert!(load_image_bytes("https://example.com/x.png").is_err());
     }
 }
+
