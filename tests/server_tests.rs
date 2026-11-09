@@ -1593,8 +1593,8 @@ async fn raw_completions_take_every_prompt_form_and_stream() {
 
     // Refused rather than ignored.
     for (extra, needle) in [
-        (serde_json::json!({"logprobs": 2, "echo": true}), "echo"),
         (serde_json::json!({"logprobs": 21}), "logprobs"),
+        (serde_json::json!({"prompt_logprobs": 21}), "prompt_logprobs"),
         (serde_json::json!({"n": 2}), "n = 1"),
         (serde_json::json!({"best_of": 3}), "best_of"),
         (serde_json::json!({"prompt": []}), "prompt"),
