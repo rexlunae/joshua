@@ -627,6 +627,30 @@ mod synthetic {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A chat whose prompt is scored (`prompt_logprobs`) still leaves its
+    /// system prompt's root for the next chat, though generation then starts
+    /// past it.
+    fn prefix_cache_root_survives_prompt_scoring(arch: &str) {
+        use joshua::types::ChatMessage;
+        let dir = prefix_cache_model(arch, "scored-root");
+        let sys = ChatMessage::text("system", "hello a b c d e");
+        let chat = |user: &str| vec![sys.clone(), ChatMessage::text("user", user)];
+        let scored = joshua::types::GenerationOptions {
+            prompt_logprobs: Some(0),
+            ..greedy(2)
+        };
+
+        let warm = cached_engine(&dir, 1 << 30);
+        warm.complete(&chat("world"), &scored).unwrap();
+        assert!(warm.prefix_cache_stats().stored >= 1, "{arch}: root stored");
+        let (second, _, _, _) = warm.complete(&chat("k l"), &greedy(3)).unwrap();
+        assert_eq!(warm.prefix_cache_stats().hits, 1, "{arch}: the new chat started from the root");
+        let plain = cached_engine(&dir, 0);
+        let (want, _, _, _) = plain.complete(&chat("k l"), &greedy(3)).unwrap();
+        assert_eq!(second, want, "{arch}: root reuse must not change output");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// A parked conversation that went further than a pooled session's
     /// history wins over continuing the pooled one.
     fn prefix_cache_prefers_a_longer_parked_conversation(arch: &str) {
@@ -652,6 +676,7 @@ mod synthetic {
         for arch in ["qwen3moe", "qwen35", "qwen4exp", "deepseek2"] {
             prefix_cache_parks_alternating_conversations(arch);
             prefix_cache_root_serves_a_new_chat(arch);
+            prefix_cache_root_survives_prompt_scoring(arch);
             prefix_cache_prefers_a_longer_parked_conversation(arch);
         }
     }

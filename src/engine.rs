@@ -3667,10 +3667,13 @@ impl Engine {
     /// admission permit: the prompt is fed from position 0 on a fresh
     /// candle session in the bounded slices [`Engine::perplexity`] uses,
     /// and the session is parked holding all but the prompt's last token,
-    /// so generation picks it up with only that token left to feed.
+    /// so generation picks it up with only that token left to feed.  The
+    /// prompt's shared head (`root`) still becomes a prefix-cache root,
+    /// though generation then starts past it.
     fn score_prompt(
         &self,
         tokens: &[u32],
+        root: Option<usize>,
         top: u32,
         scope: Option<crate::affinity::Scope>,
     ) -> Result<Vec<crate::types::TokenLogprob>> {
@@ -3706,10 +3709,30 @@ impl Engine {
                 }
             },
         );
+        // A recurrent session cannot be cut back to the prompt's shared head,
+        // so when that head's prefix-cache root is wanted the session is
+        // cleared and generation reads the prompt again, storing the root.
+        let reread = root.is_some_and(|r| {
+            r < tokens.len()
+                && !session.supports_truncate()
+                && session.supports_snapshot()
+                && self.root_wanted(&tokens[..r], scope)
+        });
         match scored {
             // All but the last token, which generation feeds for its logits.
-            Ok(fed) if fed < tokens.len() || session.truncate_to(fed - 1) => {
+            Ok(fed) if !reread && (fed < tokens.len() || session.truncate_to(fed - 1)) => {
                 let kept = fed.min(tokens.len() - 1);
+                // Generation starts past the shared head, so its root is
+                // stored here, from the session cut back to the head.
+                let root = root.filter(|&r| {
+                    r <= kept
+                        && session.supports_snapshot()
+                        && session.supports_truncate()
+                        && self.root_wanted(&tokens[..r], scope)
+                });
+                if let Some(r) = root {
+                    self.store_root(&session, &tokens[..r], kept, scope);
+                }
                 self.release_model(session, tokens[..kept].to_vec(), scope);
             }
             Ok(_) => {
@@ -4928,7 +4951,8 @@ impl Engine {
         // then stays there too, so both come from one backend.
         let prompt_logprobs = match options.prompt_logprobs {
             Some(top) => {
-                let entries = self.score_prompt(prompt_tokens, top, options.cache_namespace())?;
+                let entries =
+                    self.score_prompt(prompt_tokens, root, top, options.cache_namespace())?;
                 if let Some(sink) = &options.logprob_sink {
                     sink.set_prompt(entries.clone());
                 }
