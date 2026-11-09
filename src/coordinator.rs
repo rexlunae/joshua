@@ -735,14 +735,11 @@ impl Coordinator {
             let generation = w.dispatch_generation.load(Ordering::Acquire);
             let before = w.dispatched.load(Ordering::Acquire);
             let audio_before = w.audio_dispatched.load(Ordering::Acquire);
-            let mut ours_by_model = w.by_model().clone();
+            let by_model_before = w.by_model().clone();
             let result = self.probe(w).await;
             let after = w.dispatched.load(Ordering::Acquire);
             let audio_after = w.audio_dispatched.load(Ordering::Acquire);
-            for (model, n) in w.by_model().iter() {
-                let ours = ours_by_model.entry(model.clone()).or_default();
-                *ours = (*ours).max(*n);
-            }
+            let ours_by_model = (by_model_before, w.by_model().clone());
             let ours = before.saturating_sub(audio_before).max(after.saturating_sub(audio_after));
             (w, result, ours, audio_probe_epoch, ours_by_model, generation)
         });
@@ -786,11 +783,17 @@ impl Coordinator {
                         .iter()
                         .map(|m| {
                             // An adapter alias reports its engine's figures,
-                            // so ours on that engine is every id sharing it.
-                            let ours: usize = info
-                                .sharing(&m.id)
-                                .map(|id| ours_by_model.get(id).copied().unwrap_or(0))
-                                .sum();
+                            // so ours on that engine is every id sharing it,
+                            // summed within one snapshot (before or after the
+                            // probe) so a handoff between names is not
+                            // counted twice.
+                            let in_snapshot = |snapshot: &HashMap<String, usize>| {
+                                info.sharing(&m.id)
+                                    .map(|id| snapshot.get(id).copied().unwrap_or(0))
+                                    .sum::<usize>()
+                            };
+                            let ours = in_snapshot(&ours_by_model.0)
+                                .max(in_snapshot(&ours_by_model.1));
                             (m.id.clone(), m.in_flight.saturating_sub(ours))
                         })
                         .collect();
