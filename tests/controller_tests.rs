@@ -60,6 +60,7 @@ fn state(models: ModelRegistry, manager: Option<ModelManager>) -> Arc<ServerStat
         whisper: None,
         api_key: None,
         cors_origins: Vec::new(),
+        reasoning_format: Default::default(),
         metrics: Arc::new(joshua::server::ServerMetrics::default()),
     })
 }

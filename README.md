@@ -444,7 +444,8 @@ Besides `model`, `messages`, `stream` and `tools`:
 | `add_generation_prompt`, `continue_final_message` | Template controls (vLLM); a conversation ending in an assistant message is continued (prefill) unless `continue_final_message` is `false`; both `true` is a **400** |
 | `documents`, `echo` | Passed to the template as `documents`; `echo` repeats the continued assistant message |
 | `context_window` (alias `num_ctx`, `n_ctx`) | Per-request context window; **400** when larger than the server's `--n-ctx` (the KV cache and RoPE tables are sized at load), and the prompt must fit inside it |
-| `tool_choice` | `"none"` hides `tools`; `"required"` and named functions cannot be enforced and act like `"auto"` |
+| `tool_choice` | `"none"` hides `tools`; a named function (`{"type": "function", "function": {"name": …}}`) offers that tool alone; `"required"` offers them all without forcing a call.  A name not in `tools`, `"required"` without tools, or any other value is a **400** |
+| `prompt_cache_key` | OpenAI's cache key: requests sharing it share a prompt-cache namespace and, behind `joshua route`, a worker (an `x-joshua-affinity` handle wins over it) |
 | `stream_options` | Accepted; usage is always sent on the final chunk |
 | `n`, `logprobs`, `top_logprobs` | Only `n: 1`, `logprobs: false` and `top_logprobs: 0` are accepted; anything else is a **400** rather than silently ignored |
 | `response_format` | `{"type": "text"}`, `{"type": "json_object"}`, or `{"type": "json_schema", "json_schema": {"name": …, "schema": {…}}}` — see [Structured outputs](#structured-outputs) |
@@ -632,7 +633,9 @@ gpt-oss harmony channels; a template that opens the block in its generation
 prompt (DeepSeek-R1) is detected from the rendered prompt.
 `reasoning_format: "none"` leaves the reasoning in `content`,
 `"deepseek-legacy"` splits only non-streamed responses, and
-`include_reasoning: false` drops it.  Earlier turns' `reasoning_content`
+`include_reasoning: false` drops it.  `joshua serve --reasoning-format`
+(llama-server's flag, default `auto`) sets the format for requests that
+name none.  Earlier turns' `reasoning_content`
 (or `reasoning`, `thinking`) is passed to templates that render it.
 `thinking_token_budget` (vLLM; `reasoning_budget_tokens` in llama.cpp) and
 `reasoning.max_tokens` end the reasoning after that many tokens by forcing

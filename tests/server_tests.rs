@@ -1782,3 +1782,27 @@ async fn llama_server_native_routes_answer_in_llama_server_shapes() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+#[tokio::test]
+async fn chat_tool_choice_must_name_an_offered_tool() {
+    let app = create_router(tiny_state("server-tool-choice", None));
+    let tools = serde_json::json!([{"type": "function", "function": {"name": "f"}}]);
+    for (choice, needle) in [
+        (serde_json::json!({"type": "function", "function": {"name": "g"}}), "not in `tools`"),
+        (serde_json::json!("always"), "unknown tool_choice"),
+    ] {
+        let body = serde_json::json!({
+            "model": "", "messages": [{"role": "user", "content": "hi"}],
+            "tools": tools, "tool_choice": choice, "stream": true,
+        });
+        let res = app
+            .clone()
+            .oneshot(post_json("/v1/chat/completions", None, body))
+            .await
+            .unwrap();
+        // Refused before a stream starts.
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        let text = body_text(res).await;
+        assert!(text.contains(needle), "{text}");
+    }
+}

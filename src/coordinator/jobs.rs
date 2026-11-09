@@ -136,6 +136,7 @@ impl Coordinator {
         let work = RequestWork {
             context: None,
             units: body.len() as u64,
+            cache_key: None,
         };
         let waiting = Instant::now();
         let first = self
@@ -311,6 +312,7 @@ impl Coordinator {
         let work = RequestWork {
             context: None,
             units: payload.len() as u64,
+            cache_key: None,
         };
         let mut queue_wait = Duration::ZERO;
         let mut attempt = 0;

@@ -78,13 +78,22 @@ pub(crate) fn encode(scope: Scope) -> String {
     scope.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-pub(crate) fn cache_scope(headers: &HeaderMap, context: Option<u32>) -> Scope {
+/// A request's cache namespace: its API key's, split by the scope a
+/// coordinator sent, else the client's affinity handle, else its OpenAI
+/// `prompt_cache_key`, and by its context window.
+pub(crate) fn cache_scope(
+    headers: &HeaderMap,
+    context: Option<u32>,
+    prompt_cache_key: Option<&str>,
+) -> Scope {
     let hint = headers
         .get(CACHE_SCOPE_HEADER)
-        .or_else(|| headers.get(AFFINITY_HEADER));
+        .or_else(|| headers.get(AFFINITY_HEADER))
+        .map(|value| value.as_bytes())
+        .or_else(|| prompt_cache_key.filter(|k| !k.is_empty()).map(str::as_bytes));
     digest(&[
         owner(headers),
-        hint.map_or(&[], |value| value.as_bytes()),
+        hint.unwrap_or_default(),
         &context.unwrap_or(0).to_le_bytes(),
     ])
 }
@@ -265,15 +274,20 @@ mod tests {
         assert_ne!(digest(&[b"ab", b"c"]), digest(&[b"a", b"bc"]));
         let mut headers = HeaderMap::new();
         headers.insert(header::AUTHORIZATION, "Bearer alice".parse().unwrap());
-        let alice = cache_scope(&headers, Some(64));
-        assert_ne!(alice, cache_scope(&headers, Some(128)));
+        let alice = cache_scope(&headers, Some(64), None);
+        assert_ne!(alice, cache_scope(&headers, Some(128), None));
         headers.insert(header::AUTHORIZATION, "Bearer bob".parse().unwrap());
-        assert_ne!(alice, cache_scope(&headers, Some(64)));
+        assert_ne!(alice, cache_scope(&headers, Some(64), None));
         headers.remove(header::AUTHORIZATION);
         headers.insert("x-api-key", "alice".parse().unwrap());
-        assert_eq!(alice, cache_scope(&headers, Some(64)));
+        assert_eq!(alice, cache_scope(&headers, Some(64), None));
         headers.insert("x-api-key", "bob".parse().unwrap());
-        assert_ne!(alice, cache_scope(&headers, Some(64)));
+        assert_ne!(alice, cache_scope(&headers, Some(64), None));
+        // A prompt_cache_key splits the namespace; a header wins over it.
+        let keyed = cache_scope(&headers, Some(64), Some("k"));
+        assert_ne!(keyed, cache_scope(&headers, Some(64), None));
+        assert_eq!(keyed, cache_scope(&headers, Some(64), Some("k")));
+        assert_eq!(cache_scope(&headers, Some(64), Some("")), cache_scope(&headers, Some(64), None));
         headers.insert(AFFINITY_HEADER, "new".parse().unwrap());
         assert_ne!(handle(&headers).unwrap(), handle(&headers).unwrap());
         headers.insert(AFFINITY_HEADER, "arbitrary".parse().unwrap());
@@ -315,7 +329,7 @@ mod tests {
             headers.insert(CACHE_SCOPE_HEADER, encode(scope).parse().unwrap());
             assert_eq!(
                 worker_namespace(scope, context, Some("worker-key")),
-                namespace(Some(cache_scope(&headers, context)), context).unwrap()
+                namespace(Some(cache_scope(&headers, context, None)), context).unwrap()
             );
         }
     }
