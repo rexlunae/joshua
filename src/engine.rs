@@ -3659,6 +3659,30 @@ impl Engine {
             .map_err(|e| JoshuaError::Tokenization(e.to_string()))
     }
 
+    /// Each token's piece: the bytes it adds to the decoded text
+    /// (llama-server's `/tokenize` `with_pieces`).  A piece is decoded in
+    /// the context of the few tokens before it, so a word-initial space
+    /// stays on the token that carries it; a token that is not whole UTF-8
+    /// on its own (a byte-fallback or byte-level fragment) gives its bytes.
+    pub fn token_pieces(&self, ids: &[u32]) -> Result<Vec<Vec<u8>>> {
+        const CONTEXT: usize = 4;
+        (0..ids.len())
+            .map(|i| {
+                let start = i.saturating_sub(CONTEXT);
+                let before = self.detokenize(&ids[start..i], false)?;
+                let with = self.detokenize(&ids[start..=i], false)?;
+                Ok(match with.strip_prefix(before.as_str()) {
+                    Some(piece) if !piece.contains('\u{FFFD}') => piece.as_bytes().to_vec(),
+                    _ => self
+                        .tokenizer
+                        .id_to_token(ids[i])
+                        .map(|token| token_bytes(&token))
+                        .unwrap_or_default(),
+                })
+            })
+            .collect()
+    }
+
     /// The vocabulary size, for the tokenizer endpoints that report it and
     /// the checks on requested token ids.  Counted once: the tokenizer
     /// builds its whole vocabulary map to count it.
@@ -4545,13 +4569,15 @@ impl Engine {
     /// Tokenize `prompt` and check it as generation will, so an API layer
     /// can refuse it before a stream starts: token ids within the
     /// vocabulary, and, after any `truncate_prompt_tokens`, a prompt that is
-    /// not empty and leaves room in the request's context window.
-    pub fn check_prompt(&self, prompt: &RawPrompt, options: &GenerationOptions) -> Result<()> {
-        let n_prompt = self.tokenize_prompt(prompt)?.len();
+    /// not empty and leaves room in the request's context window.  Returns
+    /// whether `truncate_prompt_tokens` cuts the prompt (llama-server's
+    /// `truncated`).
+    pub fn check_prompt(&self, prompt: &RawPrompt, options: &GenerationOptions) -> Result<bool> {
+        let n_whole = self.tokenize_prompt(prompt)?.len();
         let n_ctx = self.request_n_ctx(options)?;
         let n_prompt = match self.prompt_keep(options, n_ctx)? {
-            Some(keep) => n_prompt.min(keep),
-            None => n_prompt,
+            Some(keep) => n_whole.min(keep),
+            None => n_whole,
         };
         if n_prompt == 0 {
             return Err(JoshuaError::InvalidRequest(
@@ -4561,7 +4587,7 @@ impl Engine {
         if n_prompt >= n_ctx {
             return Err(JoshuaError::PromptTooLong(n_prompt, n_ctx));
         }
-        Ok(())
+        Ok(n_prompt < n_whole)
     }
 
     /// Check a request's options against this model before any work, as
@@ -8156,6 +8182,39 @@ pub fn find_gguf_in_dir(dir: &Path) -> Result<PathBuf> {
     )))
 }
 
+/// The bytes a vocabulary entry stands for: SentencePiece's `<0xNN>` byte
+/// tokens and `▁` spaces, GPT-2 byte-level characters, or the entry's own
+/// text.
+fn token_bytes(token: &str) -> Vec<u8> {
+    if let Some(byte) = token
+        .strip_prefix("<0x")
+        .and_then(|t| t.strip_suffix('>'))
+        .filter(|hex| hex.len() == 2)
+        .and_then(|hex| u8::from_str_radix(hex, 16).ok())
+    {
+        return vec![byte];
+    }
+    if token.contains('\u{2581}') {
+        return token.replace('\u{2581}', " ").into_bytes();
+    }
+    // GPT-2's byte-level alphabet: printable Latin-1 bytes stand for
+    // themselves, and the rest are numbered from U+0100 in byte order.
+    let printable = |b: u32| matches!(b, 0x21..=0x7E | 0xA1..=0xAC | 0xAE..=0xFF);
+    let byte_of = |c: char| -> Option<u8> {
+        let c = c as u32;
+        if printable(c) {
+            return u8::try_from(c).ok();
+        }
+        let n = c.checked_sub(0x100)?;
+        (0u32..=0xFF).filter(|&b| !printable(b)).nth(n as usize).map(|b| b as u8)
+    };
+    token
+        .chars()
+        .map(byte_of)
+        .collect::<Option<Vec<u8>>>()
+        .unwrap_or_else(|| token.as_bytes().to_vec())
+}
+
 /// Read a token ID from GGUF metadata and decode it to its string form.
 fn token_str_from_metadata(
     gguf: &gguf_file::Content,
@@ -10142,6 +10201,16 @@ mod tests {
     /// character must be a genuine GPT-2 byte-unicode table entry — a
     /// character outside the table passes through decoding untouched and
     /// would make the fixture lie about what decoders produce.
+    #[test]
+    fn token_bytes_read_every_vocabulary_spelling() {
+        assert_eq!(token_bytes("<0xE2>"), [0xE2]);
+        assert_eq!(token_bytes("\u{2581}Hello"), b" Hello");
+        assert_eq!(token_bytes("\u{120}Hello"), b" Hello");
+        assert_eq!(token_bytes("\u{E2}\u{122}"), [0xE2, 0x80]);
+        assert_eq!(token_bytes("\u{10A}"), b"\n");
+        assert_eq!(token_bytes("<s>"), b"<s>");
+    }
+
     fn byte_level_tokenizer() -> Tokenizer {
         use std::str::FromStr;
         let json = r#"{
